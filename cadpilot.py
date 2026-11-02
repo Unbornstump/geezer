@@ -1,59 +1,44 @@
 """
-cadwriter.py (v2)  -  drawing-presence automation for CADCraft (Windows)
+cadwriter.py (v3)  -  drawing-presence automation for CADCraft (Windows)
 
-Drives CADCraft like a person drafting: starts commands from the command line (or
-sometimes by clicking the Draw tool icons), clicks points on the canvas one at a time,
-builds up whole drawings (machined plate, gear, L-bracket, floor plan, truss, flange,
-spirals, ellipses, staircase section) with holes, centre lines, offsets and dimensions,
-looks around (zoom / pan and back), peeks at menus, opens and closes dialog boxes
-(Units, Drafting Settings, Dimension Style, Options, Plot), saves, and every few
-drawings clears the canvas with ERASE ALL and starts again.
+Works on a CADCraft "project" from scratch, the way a person would:
+  new drawing -> glance at Units / Drafting Settings -> create layers -> Save As (project name)
+  -> sketch outlines -> add holes and centre lines -> offsets and dimensions -> review
+  (zoom / pan / select) -> save -> next project (Ctrl+N, a brand-new drawing).
 
-Same awareness as gridwriter v2: it stops the moment you touch the mouse/keyboard or
-another window comes to the front, waits IDLE_AFTER seconds, cancels any half-finished
-command with Escape, closes stray dialogs, and goes back to the exact step it was on.
+It stops the moment you touch the mouse/keyboard or another window comes forward, waits
+IDLE_AFTER seconds, cancels any half-finished command, closes stray dialogs / side panels and
+carries on at the exact step it was on.
 
 pip install pyautogui pygetwindow pynput pillow
 Windows + US keyboard assumed.
 F8 = pause/resume   F9 = quit   mouse top-left = emergency stop
 
-FIRST RUN:  python cadwriter.py --test
-  A fast self-check: draws a few shapes, opens a dialog, opens a menu, saves, and prints
-  PASS / FAIL for every assumption below. Fix the FAILs, then run it normally.
+FIRST TIME:
+  1. Maximise CADCraft on the MAIN monitor, close every side panel (Drafting Settings etc.).
+  2. python cadwriter.py --calibrate     (7 quick points: the script reads where things are
+                                          on YOUR screen; saved to cadwriter_calibration.json)
+  3. python cadwriter.py --test          (fast PASS / FAIL self-check)
+  4. python cadwriter.py
 
-WHAT'S NEW IN v2
-  * It looks at the screen. After a few drawing steps it parks the mouse off the canvas and
-    compares screenshots. If nothing appeared twice in a row (hidden command line, other
-    aliases, wrong window) it PAUSES and says so, instead of typing blindly for hours.
-  * It never touches your own work. If CADCraft was already open it starts a NEW drawing
-    (Ctrl+N), and ERASE ALL only runs in a drawing it saved itself (after its own Save As);
-    otherwise it stops and asks you to confirm with F8.
-  * Dialogs: it works out whether they are separate windows or drawn inside the app, never
-    presses Enter/Space inside one (so Plot can never actually plot; only the Save prompt is
-    accepted), pokes at the Plot dialog's drop-downs and check boxes, then cancels.
-    (Fixed: v1 aborted every dialog because it was not yet "inside the dialog" when the
-    dialog popped up.)
-  * Menu peeks are verified once (a menu must really open) and switched off if not, so a
-    mis-aimed click can never land on a toolbar icon again and again.
-  * DPI-aware, keeps the PC awake while running, writes cadwriter.log in WORK_DIR, releases
-    every key and mouse button on exit, warns if CADCraft is not on the main monitor.
-
-ASSUMPTIONS ABOUT CADCRAFT (check on a first short test run):
-  * the window title contains APP_MATCH ("cadcraft")
-  * AutoCAD-style command line: typing on the canvas goes to the command line and
-    these aliases work: L PL C REC A EL POL DLI O M E U UN DS D ST OP PLOT
-    (the command line must be visible - in AutoCAD-like apps Ctrl+9 toggles it)
-  * Ctrl+S saves; the first save of "Drawing1" opens a Save As dialog with the
-    file-name box focused
-  * mouse wheel zooms, middle-button drag pans
-  * dialogs are real Win32 windows. If CADCraft draws them inside its main window,
-    set DIALOGS_IN_WINDOW = True
-  * the window is maximised with the layout of the screenshot (tool sets left, canvas
-    in the middle, ViewCube top-right of the canvas). If yours differs, change
-    DRAW_AREA and TOOL_ICONS, or set TOOLBAR_CLICK_CHANCE = 0.
+WHAT'S NEW IN v3 (fixes for dialogs / clicks)
+  * CADCraft's dialogs (Drafting Settings, ...) are SIDE PANELS drawn inside the window, not Win32
+    windows. v2 did not see them, "cancelled" with Escape (does not close them) and then clicked
+    the drawing through the panel. v3 detects panels by screenshot, closes them with their X
+    button (verified, retried, Escape fallback) and never clicks inside them (hover only), so no
+    setting can be changed.
+  * Every command is verified: the command line must visibly react after typing it, and the
+    command prompt must react after the first click. Retries once; after repeated failures it
+    PAUSES and tells you why (instead of typing / clicking blindly).
+  * Clicks are more "real": a short wiggle on the spot and a longer button press.
+  * --calibrate: drawing area, command line, menu bar, Layers row, panel X and the closed-panel
+    reference are measured on your screen instead of guessed.
+  * Project workflow with phases and layers (layer creation is verified; skipped if unsupported).
+  * Never erases anything: every project is a new drawing (Ctrl+N) saved under its own name.
 """
 
 import ctypes
+import json
 import logging
 import math
 import os
@@ -69,7 +54,7 @@ from pathlib import Path
 IS_WIN = sys.platform == "win32"
 if IS_WIN:
     from ctypes import wintypes
-    try:                                    # Win32 rectangles and pyautogui must agree on scaled displays
+    try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         try:
@@ -90,16 +75,17 @@ WORK_DIR      = Path(r"C:\work")
 APP_EXE       = None                        # e.g. r"C:\Program Files\CADCraft\CADCraft.exe"; None = auto-find
 APP_MATCH     = "cadcraft"                  # text in the window title
 FILE_EXT      = ".dwg"
-WORKBOOK      = WORK_DIR / ("session_" + time.strftime("%Y%m%d_%H%M") + FILE_EXT)   # new name every run: no overwrite prompt
-
+WORKBOOK      = WORK_DIR / ("session_" + time.strftime("%Y%m%d_%H%M") + FILE_EXT)   # fallback name
+CALIB_FILE    = WORK_DIR / "cadwriter_calibration.json"
+LOG_FILE      = WORK_DIR / "cadwriter.log"
 DEBUG         = False
 
-IDLE_AFTER    = 11                          # seconds of no real input before it acts again
+IDLE_AFTER    = 11
 GAP_BETWEEN   = (8, 35)
 LONG_BREAK_CHANCE = 0.09
 LONG_BREAK    = (30, 110)
 
-# typing (same model as gridwriter v2)
+# typing
 BASE_DELAY    = 0.40
 TYPING_SPEED  = 1.0
 WPM_MIN, WPM_MAX = 12, 20
@@ -107,56 +93,51 @@ TYPO_CHANCE   = 0.03
 MICRO_STOP    = 0.08
 KEY_DWELL     = (0.06, 0.15)
 
-# canvas geometry, as fractions of the CADCraft window (left, right, top, bottom).
-# Keeps clear of the ViewCube (top right), the tool sets (left) and the status area (bottom).
-DRAW_AREA     = (0.19, 0.70, 0.21, 0.88)
-ZONE          = (0.18, 0.70, 0.30, 0.85)    # where idle mouse wandering happens
-COLS, ROWS    = 2, 2                        # each drawing gets one square slot of this grid
-SLOTS         = COLS * ROWS
+# layout, as fractions of the CADCraft window (l, r, t, b).  --calibrate overwrites these.
+DRAW_AREA     = (0.21, 0.70, 0.21, 0.88)
+COLS, ROWS    = 2, 2
+PANEL_BOX     = (0.0, 0.19, 0.12, 0.95)    # the left strip a side panel (Drafting Settings...) covers
+PANEL_CLOSE   = (0.191, 0.080)              # the panel's X button
+PANEL_THRESH  = 0.25                        # fraction of the strip that must differ = "panel is open"
+COMMAND_BOX   = (0.26, 0.64, 0.94, 1.0)     # the command line text at the bottom
+LAYER_BOX     = (0.82, 0.995, 0.255, 0.305) # the "current layer" row of the Layers panel
+PARK_SPOT     = (0.86, 0.45)                # empty spot used to park the mouse while taking screenshots
+MENU_Y        = 0.092
+MENU_X        = [0.017, 0.036, 0.059, 0.084, 0.115, 0.143, 0.169, 0.204, 0.244, 0.279, 0.309]
+CENTER_BOX    = (0.36, 0.72, 0.22, 0.88)
+X_BTN         = (24, 23)                    # title-bar X of a real Win32 dialog (px left of / below top-right)
 
-USE_ALIASES   = True                        # "l" instead of "line"
-UNDO_CHANCE   = 0.05                        # now and then: finish a step, undo it with U, redo it
+def zone_from(da):
+    return (da[0], da[1], da[2] + 0.06, da[3])
+ZONE          = zone_from(DRAW_AREA)
 
-# Draw-panel icons, as fractions of the window (taken from the screenshot).
-TOOLBAR_CLICK_CHANCE = 0.25                 # 0 = always use the command line
-TOOL_ICONS = {"line": (0.023, 0.281), "pline": (0.055, 0.281),
-              "circle": (0.087, 0.281), "rect": (0.119, 0.281)}
-
-# menu bar titles (fractions of window width, y fraction) for "peeking" at menus
-MENU_Y = 0.092
-MENU_X = [0.017, 0.036, 0.059, 0.084, 0.115, 0.143, 0.169, 0.204, 0.244, 0.279, 0.309]
+USE_ALIASES   = True
+UNDO_CHANCE   = 0.05
+USE_LAYERS    = True
+TOOLBAR_CLICK_CHANCE = 0.0                  # 0 = always the command line (reliable)
+TOOL_ICONS    = {"line": (0.023, 0.281), "pline": (0.055, 0.281),
+                 "circle": (0.087, 0.281), "rect": (0.119, 0.281)}
 
 PAUSE_KEY, QUIT_KEY = "<f8>", "<f9>"
 LAUNCH_TIMEOUT = 60
-
-SPEED         = 1.0                         # pacing multiplier (--test lowers it)
-NEW_DRAWING_IF_REUSED = True                # CADCraft already open -> Ctrl+N, never draw in your drawing
-PROBE_ON_START = True                       # quick dialog / menu check before the first real action
-MENU_PEEK     = True                        # glance at menu-bar menus now and then (verified once)
-VERIFY_DRAWING = True                       # screenshot checks that drawing really appears
-CHANGE_MIN    = 0.004                       # fraction of the canvas that must change after a few steps
-CENTER_BOX    = (0.36, 0.72, 0.22, 0.88)    # where dialogs show up (fractions l, r, t, b of the window)
-X_BTN         = (24, 23)                    # a dialog's title-bar X: pixels left of / below its top-right corner
-LOG_FILE      = WORK_DIR / "cadwriter.log"
-
-# dialogs: opened by typing a command; "tabs" = Tab presses inside; closed by Escape or the title-bar X
+SPEED         = 1.0
+NEW_DRAWING_IF_REUSED = True
+PROBE_ON_START = True
+MENU_PEEK     = True
+VERIFY_DRAWING = True
+CHANGE_MIN    = 0.004
+DEAD_LIMIT    = 3                           # consecutive "nothing reacted" checks before pausing
 DIALOG_CHANCE_WEIGHT = 1.0
-DIALOGS_IN_WINDOW = False
-CLOSE_BY_CLICK    = True
+CLOSE_BY_CLICK = True
+
+# dialogs: opened by command; they are only LOOKED at (hover), never clicked inside.
 DIALOGS = {
-    "units":     {"alias": "un",   "tabs": (0, 3), "w": 1.0},
-    "drafting":  {"alias": "ds",   "tabs": (0, 4), "w": 1.0},
-    "dimstyle":  {"alias": "d",    "tabs": (0, 4), "w": 0.8},
-    "textstyle": {"alias": "st",   "tabs": (0, 3), "w": 0.6},
-    "options":   {"alias": "op",   "tabs": (0, 5), "w": 0.6},
-    "plot":      {"alias": "plot", "tabs": (0, 4), "w": 0.8,
-                  # Click targets inside the Plot dialog, as fractions of its window (measured on a screenshot).
-                  # "list" = drop-down (looked at, then closed with ONE Escape), "tick" = check box / radio.
-                  # Nothing here ever presses OK or Preview, and the dialog is always cancelled.
-                  "pokes": [(0.36, 0.12, "list"), (0.46, 0.20, "list"), (0.46, 0.27, "list"),
-                            (0.25, 0.33, "tick"), (0.40, 0.33, "tick"), (0.35, 0.39, "list"),
-                            (0.25, 0.45, "tick"), (0.25, 0.51, "tick"), (0.25, 0.76, "tick"),
-                            (0.25, 0.82, "tick"), (0.46, 0.88, "list")]},
+    "units":     {"alias": "un",   "w": 1.0},
+    "drafting":  {"alias": "ds",   "w": 1.0},
+    "dimstyle":  {"alias": "d",    "w": 0.8},
+    "textstyle": {"alias": "st",   "w": 0.6},
+    "options":   {"alias": "op",   "w": 0.6},
+    "plot":      {"alias": "plot", "w": 0.8},
 }
 
 # ───────────────────────── LOGGING / SAFETY ─────────────────────────
@@ -199,6 +180,12 @@ if IS_WIN:
 
     user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
 
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
 def pid_of(h):
     try:
         pid = wintypes.DWORD(0)
@@ -219,7 +206,6 @@ def win_rect(h):
     return None
 
 def menu_open(main=None):
-    """True while a menu (menu bar drop-down, right-click menu) of CADCraft is open."""
     if not IS_WIN:
         return False
     try:
@@ -232,7 +218,7 @@ def menu_open(main=None):
         info = GUITHREADINFO()
         info.cbSize = ctypes.sizeof(GUITHREADINFO)
         if user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
-            return bool(info.flags & 0x4)          # GUI_INMENUMODE
+            return bool(info.flags & 0x4)
     except Exception:
         pass
     return False
@@ -247,6 +233,7 @@ action_started = 0.0
 bot_ts = 0.0
 USE_TIME_FILTER = False
 listeners = []
+PANEL_REF = None                # tiny picture of PANEL_BOX with NO panel open
 
 
 class State:
@@ -264,16 +251,22 @@ class State:
         self.drift = 1.0
         self.governor = 1.0
         self.cell_mult = 1.0
-        self.saved = False             # has the first Save As been done?
-        self.scene = None              # the drawing in progress
-        self.next_slot = 0
-        self.scenes_done = 0
+        self.saved = False          # has Save As been done for the current drawing?
+        self.blank = True           # the current drawing is a blank one of ours (no Ctrl+N needed yet)
+        self.project = None
+        self.projects_done = 0
+        self.slot = 0               # drawing slot used by px()
         self.view = {"zoom": 0, "zpos": None, "pan": (0, 0)}
-        self.reused = False            # attached to a CADCraft that was already open
-        self.menu_ok = None            # None = not verified yet; True / False after the first menu peek
-        self.checks = 0                # drawing checks done so far
-        self.dead = 0                  # consecutive checks where nothing appeared
-        self.erase_warned = False      # the user was asked before erasing a drawing we did not save
+        self.reused = False
+        self.menu_ok = None
+        self.menu_fail = 0
+        self.checks = 0
+        self.dead = 0               # blank-canvas checks in a row
+        self.cmd_dead = 0           # commands the command line did not react to, in a row
+        self.click_dead = 0         # clicks the prompt did not react to, in a row
+        self.cmd_snap = None
+        self.layers_ok = None       # None = unknown, True / False after the first try
+        self.dialog_kind = None     # "window" | "panel" | None
 
 
 S = State()
@@ -283,6 +276,17 @@ class Interrupted(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+def halt(lines):
+    """Pause with an explanation (F8 resumes, F9 quits)."""
+    log("=" * 60)
+    for l in lines:
+        log(l)
+    log("Fix it, then press F8 to carry on (or F9 to quit).")
+    log("=" * 60)
+    running.clear()
+    raise Interrupted("halt")
 
 
 # ───────────────────────── INPUT PRIMITIVES ─────────────────────────
@@ -464,21 +468,21 @@ def main_hwnd():
     return best
 
 def dialog_hwnd():
-    """Handle of a dialog / popup that belongs to CADCraft and is open right now, else 0."""
+    """Handle of a REAL dialog / popup window of CADCraft open right now (or the main window if a menu is open)."""
     if not IS_WIN:
         return 0
     main = main_hwnd()
     if not main:
         return 0
     try:
-        pop = user32.GetWindow(main, 6)              # GW_ENABLEDPOPUP
+        pop = user32.GetWindow(main, 6)
         if pop and pop != main and user32.IsWindowVisible(pop):
             return pop
         fg = user32.GetForegroundWindow()
         if fg and fg != main and user32.IsWindowVisible(fg) and pid_of(fg) == pid_of(main):
             return fg
         if menu_open(main):
-            return main                              # sentinel: a menu is open
+            return main
     except Exception:
         pass
     return 0
@@ -523,7 +527,7 @@ def bring_back():
     for _ in range(3):
         activate_main()
         time.sleep(0.75)
-        if dialog_hwnd():                         # the Alt tap can leave the menu bar in menu mode
+        if dialog_hwnd():
             close_dialogs(accept=False)
         if app_ok():
             return True
@@ -623,12 +627,18 @@ def human_move(tx, ty, speed=1.0):
         _leg(tx, ty, dur)
 
 def human_click(x, y, clicks=1, button="left"):
+    """Move, settle, wiggle 1 px (so the app sees a fresh mouse-move on the spot), press for a real-looking time."""
     human_move(x, y)
-    time.sleep(random.uniform(0.05, 0.2))
+    time.sleep(random.uniform(0.08, 0.22))
+    if button == "left":
+        ms_move(x + random.choice([-1, 1]), y)
+        time.sleep(random.uniform(0.02, 0.05))
+        ms_move(x, y)
+        time.sleep(random.uniform(0.04, 0.09))
     for c in range(clicks):
         guard()
         ms_down(button)
-        time.sleep(random.uniform(0.035, 0.09))
+        time.sleep(random.uniform(0.07, 0.14))
         ms_up(button)
         if c < clicks - 1:
             time.sleep(random.uniform(0.06, 0.13))
@@ -663,21 +673,21 @@ def rect_point(rc, fx0, fx1, fy0, fy1):
     return random.uniform(l + fx0 * W, l + fx1 * W), random.uniform(t + fy0 * H, t + fy1 * H)
 
 def win_frac(fx, fy):
-    """Window-relative fraction -> screen pixel."""
     rc = win_rect(main_hwnd())
     if not rc:
         sw, sh = pyautogui.size()
         return fx * sw, fy * sh
     return rc[0] + fx * (rc[2] - rc[0]), rc[1] + fy * (rc[3] - rc[1])
 
-# ── EYES: tiny screenshot comparisons, so the script notices what really happened ──
+# ── EYES ──
 def park_mouse():
-    """Look away from the canvas: the crosshair and tooltips would otherwise show up in screenshots."""
-    human_move(*win_frac(random.uniform(0.04, 0.10), random.uniform(0.50, 0.60)), speed=0.8)
+    """Move the mouse to an empty spot so the crosshair / tooltips don't pollute screenshots."""
+    human_move(*win_frac(PARK_SPOT[0] + random.uniform(-0.03, 0.03), PARK_SPOT[1] + random.uniform(-0.05, 0.05)),
+               speed=0.8)
     quiet_nap(random.uniform(0.25, 0.6))
 
 def grab(box, size=(48, 32)):
-    """Tiny grey-scale picture of part of the CADCraft window (box = fractions l, r, t, b), or None."""
+    """Tiny grey picture of part of the CADCraft window (box = fractions l, r, t, b), or None."""
     if Image is None:
         return None
     try:
@@ -686,7 +696,7 @@ def grab(box, size=(48, 32)):
         W, H = r - l, b - t
         x0, y0 = max(int(l + box[0] * W), 0), max(int(t + box[2] * H), 0)
         x1, y1 = min(int(l + box[1] * W), sw), min(int(t + box[3] * H), sh)
-        if x1 - x0 < 20 or y1 - y0 < 20:
+        if x1 - x0 < 8 or y1 - y0 < 8:
             return None
         im = pyautogui.screenshot(region=(x0, y0, x1 - x0, y1 - y0)).convert("L")
         return im.resize(size, getattr(Image, "Resampling", Image).BOX).tobytes()
@@ -694,26 +704,56 @@ def grab(box, size=(48, 32)):
         return None
 
 def changed(a, b, cell=3):
-    """Fraction of cells that differ between two grab()s, or None if either is missing."""
     if not a or not b or len(a) != len(b):
         return None
     return sum(1 for x, y in zip(a, b) if abs(x - y) > cell) / len(a)
 
-def dialog_up(before=None):
-    """A dialog is open: a real window, or (in-window mode) the middle of the window changed."""
-    if dialog_hwnd():
+def panel_open():
+    """True while a side panel (Drafting Settings, Units, ...) covers the left strip."""
+    if PANEL_REF is None:
+        return False
+    d = changed(PANEL_REF, grab(PANEL_BOX), 4)
+    return d is not None and d > PANEL_THRESH
+
+def capture_panel_ref():
+    global PANEL_REF
+    PANEL_REF = grab(PANEL_BOX)
+
+def panel_rect_px():
+    sw, sh = pyautogui.size()
+    l, t, r, b = win_rect(main_hwnd()) or (0, 0, sw, sh)
+    W, H = r - l, b - t
+    return l, t + PANEL_BOX[2] * H, l + (PANEL_BOX[1] + 0.012) * W, t + PANEL_BOX[3] * H
+
+def close_panel():
+    """Close an in-window side panel with its X (verified by screenshot), Escape as a fallback. Never clicks inside it."""
+    prev = S.in_dialog
+    S.in_dialog = True
+    try:
+        for attempt in range(4):
+            if PANEL_REF is not None and not panel_open():
+                return True
+            quiet_nap(random.uniform(0.3, 0.8))
+            if attempt % 2 == 0:
+                x, y = win_frac(*PANEL_CLOSE)
+                human_click(x + random.uniform(-3, 3), y + random.uniform(-3, 3))
+            else:
+                kb_press("escape")
+            quiet_nap(random.uniform(0.7, 1.1))
+            if PANEL_REF is None:
+                return True
+        if panel_open():
+            halt(["A side panel is still open and I cannot close it.",
+                  "Close it yourself, or run  python cadwriter.py --calibrate  to re-measure the X button."])
         return True
-    if DIALOGS_IN_WINDOW and before:
-        d = changed(before, grab(CENTER_BOX))
-        return d is not None and d > 0.12
-    return False
+    finally:
+        S.in_dialog = prev
 
 def look_canvas():
     park_mouse()
     return grab(DRAW_AREA, (64, 40))
 
 def verify_drawing(before):
-    """After a few steps something must have appeared on the canvas. Two blank checks in a row -> pause."""
     d = changed(before, look_canvas())
     if d is None:
         return True
@@ -725,14 +765,10 @@ def verify_drawing(before):
     S.dead += 1
     log(f"check: NOTHING appeared on the canvas ({S.dead}/2)")
     if S.dead >= 2:
-        log("=" * 56)
-        log("Nothing is being drawn. Likely causes: the command line is hidden or uses other aliases,")
-        log("DRAW_AREA is wrong, or CADCraft is not the window being driven.")
-        log("Fix it, then press F8 to carry on (or F9 to quit).")
-        log("=" * 56)
         S.dead = 0
-        running.clear()
-        raise Interrupted("verify")
+        halt(["Nothing is being drawn. Likely causes: a side panel covers the canvas, the command line",
+              "is hidden / uses other aliases, DRAW_AREA is wrong (run --calibrate), or another window is driven.",
+              "If CADCraft runs as Administrator, run this script as Administrator too."])
     return False
 
 def alive(h):
@@ -742,7 +778,6 @@ def alive(h):
         return False
 
 def release_all():
-    """Never leave a key or a mouse button held down."""
     for k in ("shift", "ctrl", "alt"):
         try:
             pyautogui.keyUp(k)
@@ -755,11 +790,10 @@ def release_all():
             pass
 
 def keep_awake(on=True):
-    """Stop Windows from sleeping or blanking the screen while this runs (undone on exit)."""
     if not IS_WIN:
         return
     try:
-        flags = 0x80000000 | ((0x1 | 0x2) if on else 0)   # ES_CONTINUOUS | SYSTEM_REQUIRED | DISPLAY_REQUIRED
+        flags = 0x80000000 | ((0x1 | 0x2) if on else 0)
         ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
     except Exception:
         pass
@@ -768,19 +802,14 @@ def keep_awake(on=True):
 def drift():
     x, y = pyautogui.position()
     x0, x1, y0, y1 = zone_rect()
-    human_move(
-        min(max(x + random.randint(-38, 38), x0), x1),
-        min(max(y + random.randint(-22, 22), y0), y1),
-        0.55
-    )
+    human_move(min(max(x + random.randint(-38, 38), x0), x1),
+               min(max(y + random.randint(-22, 22), y0), y1), 0.55)
 
 def wander():
-    """Mouse-only wandering. No wheel here: scrolling would zoom the drawing."""
     if random.random() < 0.65:
         drift()
     else:
-        human_move(*zone_point(bias_left=random.random() < 0.5),
-                   speed=random.uniform(0.5, 1.1))
+        human_move(*zone_point(bias_left=random.random() < 0.5), speed=random.uniform(0.5, 1.1))
 
 def small_jitter():
     x, y = pyautogui.position()
@@ -952,7 +981,6 @@ def draw_area_px():
     return l + DRAW_AREA[0] * W, t + DRAW_AREA[2] * H, l + DRAW_AREA[1] * W, t + DRAW_AREA[3] * H
 
 def slot_square(i):
-    """Square slot i of the grid: (left, top, side). Equal axes so circles stay round."""
     l, t, r, b = draw_area_px()
     cw, ch = (r - l) / COLS, (b - t) / ROWS
     s = min(cw, ch) * 0.9
@@ -961,17 +989,14 @@ def slot_square(i):
     return cx - s / 2, cy - s / 2, s
 
 def px(x, y):
-    """Unit-square drawing coordinates (0..1) of the current drawing -> screen pixels."""
-    sx, sy, s = slot_square(S.scene["slot"])
+    sx, sy, s = slot_square(S.slot)
     return sx + x * s, sy + y * s
 
 def polar(cx, cy, r, ang):
     return cx + r * math.cos(ang), cy + r * math.sin(ang)
 
 
-# ───────────────────────── DRAWINGS (lists of steps in unit coordinates) ─────────────────────────
-# step kinds: line, pline, rect, circle, arc, ellipse, polygon, dim, offset, move
-
+# ───────────────────────── PARTS (lists of steps in unit coordinates) ─────────────────────────
 def sc_plate():
     x0, x1 = 0.08, 0.92
     y0, y1 = random.uniform(0.2, 0.26), random.uniform(0.72, 0.78)
@@ -1013,18 +1038,17 @@ def sc_bracket():
 
 def sc_floorplan():
     vx = random.uniform(0.4, 0.6)
-    st = [("rect", (0.06, 0.14), (0.94, 0.86)),
-          ("offset", (0.3, 0.14), (0.3, 0.18)),
-          ("line", [(vx, 0.18), (vx, 0.5)]),
-          ("line", [(0.1, 0.55), (vx, 0.55)]),
-          ("line", [(vx, 0.62), (vx, 0.82)]),
-          ("arc", (vx, 0.62), (vx + 0.06, 0.585), (vx + 0.08, 0.53)),
-          ("arc", (0.2, 0.55), (0.235, 0.6), (0.29, 0.62)),
-          ("line", [(0.7, 0.18), (0.7, 0.3)]),
-          ("line", [(0.7, 0.3), (0.9, 0.3)]),
-          ("dim", (0.06, 0.86), (0.94, 0.86), (0.5, 0.96)),
-          ("dim", (0.94, 0.14), (0.94, 0.86), (0.995, 0.5))]
-    return st
+    return [("rect", (0.06, 0.14), (0.94, 0.86)),
+            ("offset", (0.3, 0.14), (0.3, 0.18)),
+            ("line", [(vx, 0.18), (vx, 0.5)]),
+            ("line", [(0.1, 0.55), (vx, 0.55)]),
+            ("line", [(vx, 0.62), (vx, 0.82)]),
+            ("arc", (vx, 0.62), (vx + 0.06, 0.585), (vx + 0.08, 0.53)),
+            ("arc", (0.2, 0.55), (0.235, 0.6), (0.29, 0.62)),
+            ("line", [(0.7, 0.18), (0.7, 0.3)]),
+            ("line", [(0.7, 0.3), (0.9, 0.3)]),
+            ("dim", (0.06, 0.86), (0.94, 0.86), (0.5, 0.96)),
+            ("dim", (0.94, 0.14), (0.94, 0.86), (0.995, 0.5))]
 
 def sc_truss():
     xs = [0.08 + i * 0.21 for i in range(5)]
@@ -1085,27 +1109,67 @@ def sc_stairs():
             ("dim", (0.12, 0.8), (0.12 + 0.7, 0.8), (0.5, 0.93)),
             ("dim", (0.12 + 0.7, 0.8), (0.12 + 0.7, 0.8 - 0.55), (0.97, 0.5))]
 
-SCENES = {
-    "plate": (sc_plate, 1.3), "gear": (sc_gear, 1.0), "bracket": (sc_bracket, 1.1),
-    "floorplan": (sc_floorplan, 1.0), "truss": (sc_truss, 0.9), "flange": (sc_flange, 1.0),
-    "spiral": (sc_spiral, 0.7), "orbit": (sc_orbit, 0.7), "stairs": (sc_stairs, 0.8),
-}
+SCENES = {"plate": sc_plate, "gear": sc_gear, "bracket": sc_bracket, "floorplan": sc_floorplan,
+          "truss": sc_truss, "flange": sc_flange, "spiral": sc_spiral, "orbit": sc_orbit,
+          "stairs": sc_stairs}
+
+# a project = a named set of parts (each in its own corner of the sheet)
+PROJECTS = [
+    ("Mounting_Plate",  ["plate", "flange"]),
+    ("Gear_Housing",    ["gear", "flange", "orbit"]),
+    ("Bracket_Set",     ["bracket", "plate"]),
+    ("House_Plan",      ["floorplan", "stairs"]),
+    ("Roof_Truss",      ["truss", "stairs"]),
+    ("Cam_Study",       ["spiral", "orbit"]),
+    ("Flange_Detail",   ["flange", "gear"]),
+]
+# drafting phases: what is drawn first, second ...
+PHASE_OF = {"rect": 0, "pline": 0, "polygon": 0, "ellipse": 0,
+            "arc": 1, "circle": 1, "line": 1,
+            "offset": 2, "dim": 2, "move": 3}
+PHASE_NAMES = ["sketching the outlines", "adding holes and centre lines", "offsets and dimensions", "final touches"]
+PHASE_LAYER = {0: "OUTLINE", 1: "DETAILS", 2: "DIMS", 3: "OUTLINE"}
+LAYER_NAMES = ["OUTLINE", "DETAILS", "DIMS"]
 
 
 # ───────────────────────── COMMANDS AND STEPS ─────────────────────────
 ALIAS = {"line": ("line", "l"), "pline": ("pline", "pl"), "circle": ("circle", "c"),
          "rect": ("rectang", "rec"), "arc": ("arc", "a"), "ellipse": ("ellipse", "el"),
          "polygon": ("polygon", "pol"), "dim": ("dimlinear", "dli"), "offset": ("offset", "o"),
-         "move": ("move", "m"), "erase": ("erase", "e"), "undo": ("undo", "u")}
+         "move": ("move", "m"), "undo": ("undo", "u")}
+
+def cmd_look():
+    return grab(COMMAND_BOX, (96, 24))
 
 def start_cmd(kind):
+    """Start a drawing command and CHECK that the command line reacted (retry once, pause after repeated failures)."""
     full, short = ALIAS[kind]
-    if kind in TOOL_ICONS and random.random() < TOOLBAR_CLICK_CHANCE:
+    if kind in TOOL_ICONS and TOOLBAR_CLICK_CHANCE and random.random() < TOOLBAR_CLICK_CHANCE:
         x, y = win_frac(*TOOL_ICONS[kind])
         human_click(x + random.uniform(-3, 3), y + random.uniform(-3, 3))
         nap(random.uniform(0.5, 1.1))
+        S.cmd_snap = cmd_look()
         return
-    say(short if USE_ALIASES else full)
+    for attempt in (1, 2):
+        before = cmd_look()
+        say(short if USE_ALIASES else full)
+        snap = cmd_look()
+        d = changed(before, snap, 4)
+        if d is None or d >= 0.01:
+            S.cmd_dead = 0
+            S.cmd_snap = snap
+            return
+        S.cmd_dead += 1
+        log(f"warning: the command line did not react to '{short}' ({S.cmd_dead}/{DEAD_LIMIT})")
+        if S.cmd_dead >= DEAD_LIMIT:
+            S.cmd_dead = 0
+            halt(["Typed commands are not reaching CADCraft's command line.",
+                  "Check: command line visible? canvas has focus? (COMMAND_BOX right? run --calibrate)",
+                  "If CADCraft runs as Administrator, run this script as Administrator too."])
+        if attempt == 1:
+            hit("escape")
+            focus_canvas()
+    S.cmd_snap = None
 
 def click_at(x, y):
     X, Y = px(x, y)
@@ -1113,7 +1177,21 @@ def click_at(x, y):
     if random.random() < 0.35:
         think(0.25, 1.0)
     human_click(X, Y)
-    nap(random.uniform(0.2, 0.8))
+    nap(random.uniform(0.3, 0.8))
+    if S.cmd_snap is not None:                    # first click after a command: the prompt must change
+        snap, S.cmd_snap = S.cmd_snap, None
+        d = changed(snap, cmd_look(), 4)
+        if d is not None:
+            if d < 0.01:
+                S.click_dead += 1
+                log(f"warning: the click did not change the command prompt ({S.click_dead}/{DEAD_LIMIT})")
+                if S.click_dead >= DEAD_LIMIT:
+                    S.click_dead = 0
+                    halt(["Clicks are not reaching the drawing canvas.",
+                          "Likely: a side panel is covering it, DRAW_AREA is off (run --calibrate), or CADCraft",
+                          "runs as Administrator (then run this script as Administrator too)."])
+            else:
+                S.click_dead = 0
 
 def do_step(st):
     k = st[0]
@@ -1139,12 +1217,8 @@ def do_step(st):
         cx, cy = st[1]
         click_at(cx, cy)
         click_at(*polar(cx, cy, st[2], random.uniform(0, 2 * math.pi)))
-    elif k == "arc":
-        start_cmd("arc")
-        for p in st[1:4]:
-            click_at(*p)
-    elif k == "ellipse":
-        start_cmd("ellipse")
+    elif k in ("arc", "ellipse"):
+        start_cmd(k)
         for p in st[1:4]:
             click_at(*p)
     elif k == "polygon":
@@ -1161,76 +1235,162 @@ def do_step(st):
         click_at(*st[3])
     elif k == "offset":
         start_cmd("offset")
-        say("t")                                  # "through point" option: no distance needed
+        say("t")
         click_at(*st[1])
         click_at(*st[2])
         hit("enter")
     elif k == "move":
         start_cmd("move")
-        click_at(-0.03, -0.03)                    # window-select the whole drawing
+        click_at(-0.03, -0.03)
         click_at(1.03, 1.03)
         hit("enter")
         nap(random.uniform(0.3, 0.8))
         click_at(0.5, 0.5)
         click_at(0.5 + st[1][0], 0.5 + st[1][1])
+    S.cmd_snap = None
     nap(random.uniform(0.4, 1.1))
 
 def undo_redo(st):
-    """Looks at the result, undoes it with U, then does it again."""
     think(1.0, 2.5)
     say("u")
     think(0.6, 1.6)
     do_step(st)
 
 
-# ───────────────────────── DRAWING FLOW ─────────────────────────
-def reset_drawing():
-    if not S.saved and not S.erase_warned:
-        S.erase_warned = True
-        log("=" * 56)
-        log("The canvas is full and needs clearing, but this drawing was not created and saved by me")
-        log("(no Save As has happened), so it could contain your own work. ERASE ALL has NOT been sent.")
-        log("Press F8 to confirm that clearing it is fine, or F9 to quit.")
-        log("=" * 56)
-        running.clear()
-        raise Interrupted("unsafe")
-    log("clearing the canvas")
-    start_cmd("erase")
-    say("all")
-    hit("enter")
-    nap(0.8)
-    S.next_slot = 0
-    S.scene = None
-    save()
-
-
-def new_scene():
-    if S.next_slot >= SLOTS:
-        reset_drawing()
-    names = [n for n in SCENES if n not in S.recent[-3:]] or list(SCENES)
-    name = random.choices(names, [SCENES[n][1] for n in names])[0]
-    steps = SCENES[name][0]()
-    if random.random() < 0.25:
-        steps.append(("move", (random.choice([-1, 1]) * 0.03, random.choice([-1, 1]) * 0.02)))
+# ───────────────────────── PROJECT FLOW ─────────────────────────
+def new_project():
+    pool = [p for p in PROJECTS if p[0] not in S.recent[-3:]] or PROJECTS
+    name, parts = random.choice(pool)
     S.recent.append(name)
-    S.scene = {"name": name, "steps": steps, "i": 0, "slot": S.next_slot}
-    S.next_slot += 1
-    log(f"new drawing: {name} (slot {S.scene['slot'] + 1}/{SLOTS}, {len(steps)} steps)")
+    queue = []
+    for si, part in enumerate(parts):
+        for k, st in enumerate(SCENES[part]()):
+            queue.append({"phase": PHASE_OF.get(st[0], 1), "slot": si, "part": part, "st": st, "k": k})
+    queue.sort(key=lambda q: (q["phase"], q["slot"], q["k"]))
+    if random.random() < 0.3:
+        queue.append({"phase": 3, "slot": 0, "part": parts[0], "k": 99,
+                      "st": ("move", (random.choice([-1, 1]) * 0.03, random.choice([-1, 1]) * 0.02))})
+    stamp = time.strftime("%H%M%S")
+    S.project = {"name": name, "title": name.replace("_", " "), "parts": parts, "queue": queue,
+                 "i": 0, "phase": -1, "setup": 0,
+                 "path": WORK_DIR / f"{name}_{stamp}{FILE_EXT}"}
+    log(f"NEW PROJECT: {S.project['title']}  parts={parts}  steps={len(queue)}  file={S.project['path'].name}")
 
-def work_scene():
-    if not S.scene:
-        new_scene()
-    sc = S.scene
+def new_blank_drawing():
+    """A brand-new drawing for the project (Ctrl+N). The very first project uses the blank drawing we already have."""
+    if S.blank:
+        S.blank = False
+        S.saved = False
+        return
+    S.in_dialog = True
+    try:
+        hit("escape")
+        nap(0.3)
+        hit("ctrl", "n")
+        quiet_nap(random.uniform(1.4, 2.2))
+        if dialog_hwnd():
+            log("new-drawing dialog: accepting the default")
+            close_dialogs(accept=True)
+        elif panel_open():
+            log("new-drawing panel: accepting the default")
+            kb_press("enter")
+            quiet_nap(1.0)
+            if panel_open():
+                close_panel()
+        quiet_nap(1.0)
+    finally:
+        S.in_dialog = False
+    S.saved = False
+
+def layer_cmd(opt, name):
+    """-LAYER  <option>  <name>  Enter   (m = make + set current, s = set current)."""
+    try:
+        say("-layer")
+        say(opt)
+        say(name)
+        hit("enter")
+        nap(0.4)
+    finally:
+        hit("escape")
+        nap(0.2)
+        hit("escape")
+
+def make_layers():
+    if not USE_LAYERS or S.layers_ok is False:
+        return
+    park_mouse()
+    before = grab(LAYER_BOX, (48, 8))
+    for nm in LAYER_NAMES:
+        layer_cmd("m", nm)
+    park_mouse()
+    d = changed(before, grab(LAYER_BOX, (48, 8)), 4)
+    if d is None:
+        S.layers_ok = True
+    elif d > 0.05:
+        S.layers_ok = True
+        log("layers: created (the current-layer row changed)")
+    else:
+        S.layers_ok = False
+        log("layers: the current-layer row did not change - -LAYER is not supported here (or LAYER_BOX is off); "
+            "layer steps switched off")
+    if S.layers_ok:
+        layer_cmd("s", PHASE_LAYER[0])
+
+def set_layer(name):
+    if USE_LAYERS and S.layers_ok:
+        layer_cmd("s", name)
+
+def project_setup(max_steps=2):
+    """Start from scratch: new drawing, glance at settings, make layers, save under the project's name."""
+    P = S.project
+    steps = ["new", "units", "settings", "layers", "saveas"]
+    n = 0
+    while P["setup"] < len(steps) and n < max_steps:
+        s = steps[P["setup"]]
+        log(f"project '{P['title']}': setup - {s}")
+        if s == "new":
+            new_blank_drawing()
+        elif s == "units":
+            act_dialog("units")
+        elif s == "settings":
+            act_dialog("drafting")
+        elif s == "layers":
+            make_layers()
+        elif s == "saveas":
+            S.saved = False
+            save()
+        P["setup"] += 1
+        n += 1
+        think(1.0, 3.0)
+
+def enter_phase(P, ph):
+    if P["phase"] >= 0:
+        save()
+        if random.random() < 0.5:
+            act_look_around()
+    log(f"project '{P['title']}': {PHASE_NAMES[ph]}")
+    set_layer(PHASE_LAYER[ph])
+    P["phase"] = ph
+
+def work_project():
+    if not S.project:
+        new_project()
+    P = S.project
+    if P["setup"] < 5:
+        return project_setup()
     check = VERIFY_DRAWING and (S.checks < 3 or random.random() < 0.25)
     before = look_canvas() if check else None
     todo = random.randint(2, 4)
     done = 0
-    while sc["i"] < len(sc["steps"]) and done < todo:
-        st = sc["steps"][sc["i"]]
-        do_step(st)
-        if st[0] != "move" and random.random() < UNDO_CHANCE:
-            undo_redo(st)
-        sc["i"] += 1
+    while P["i"] < len(P["queue"]) and done < todo:
+        it = P["queue"][P["i"]]
+        if it["phase"] != P["phase"]:
+            enter_phase(P, it["phase"])
+        S.slot = it["slot"]
+        do_step(it["st"])
+        if it["st"][0] != "move" and random.random() < UNDO_CHANCE:
+            undo_redo(it["st"])
+        P["i"] += 1
         done += 1
         nap(random.uniform(0.4, 1.3))
         if random.random() < 0.14:
@@ -1239,50 +1399,74 @@ def work_scene():
             save()
     if check and before is not None:
         verify_drawing(before)
-    if sc["i"] >= len(sc["steps"]):
-        S.scene = None
-        S.scenes_done += 1
-        log(f"finished '{sc['name']}' ({S.scenes_done} so far)")
+    if P["i"] >= len(P["queue"]):
+        think(1.0, 3.0)
+        save()
+        S.projects_done += 1
+        log(f"PROJECT COMPLETE: {P['title']} ({S.projects_done} so far)")
+        S.project = None
+        S.blank = False
+        return
     save()
     w = typing_wpm()
     if w:
-        log(f"typing ~ {w:.0f} wpm (while typing, pauses excluded)")
+        log(f"typing ~ {w:.0f} wpm (pauses excluded)")
 
 
-# ───────────────────────── SAVE / CLEANUP / VIEW ─────────────────────────
+# ───────────────────────── SAVE / VIEW ─────────────────────────
+def dialog_up(before=None):
+    if dialog_hwnd():
+        return True
+    if before:
+        d = changed(before, grab(PANEL_BOX), 4)
+        return d is not None and d > PANEL_THRESH
+    return False
+
 def save():
-    before = grab(CENTER_BOX) if DIALOGS_IN_WINDOW else None
+    before = grab(PANEL_BOX)
     hit("ctrl", "s")
     quiet_nap(random.uniform(0.8, 1.4))
     if not dialog_up(before):
         return
+    path = S.project["path"] if S.project else WORKBOOK
     prev = S.in_dialog
     S.in_dialog = True
     try:
         if not S.saved:
-            log("first save: Save As dialog")
+            log(f"Save As: {Path(path).name}")
             quiet_nap(random.uniform(0.4, 0.9))
             hit("ctrl", "a")
             nap(0.3)
-            type_text(str(WORKBOOK), typos=False)
+            type_text(str(path), typos=False)
             nap(random.uniform(0.4, 0.9))
             hit("enter")
             quiet_nap(random.uniform(0.8, 1.5))
             S.saved = True
-        if dialog_up(before):                 # e.g. a confirmation prompt: the ONLY place Enter is accepted
+        if dialog_hwnd():
             log("save opened a prompt")
-            close_dialogs(accept=True, assume_open=(DIALOGS_IN_WINDOW and not dialog_hwnd()))
+            close_dialogs(accept=True)
+        if panel_open():
+            close_panel()
     finally:
         S.in_dialog = prev
-
 
 def heal():
     log("healing after interruption")
     if dialog_hwnd():
         close_dialogs(accept=False)
     for _ in range(3):
-        hit("escape")                         # cancels whatever command was half-way
+        hit("escape")
         nap(0.2)
+    if panel_open():
+        close_panel()
+
+def ensure_clean():
+    """Before every action: no dialog window, no side panel."""
+    if dialog_hwnd():
+        close_dialogs(accept=False)
+    if panel_open():
+        log("a side panel is open - closing it")
+        close_panel()
 
 def focus_canvas():
     hit("escape")
@@ -1294,7 +1478,6 @@ def focus_canvas():
     hit("escape")
 
 def restore_view():
-    """If a previous zoom / pan was cut short, put the view back the way it was."""
     v = S.view
     if v["pan"] != (0, 0):
         cx, cy = win_frac(0.45, 0.55)
@@ -1329,30 +1512,35 @@ def hover_menu_bar():
     rc = win_rect(main_hwnd())
     if not rc:
         return
-    x, y = rect_point(rc, 0.01, 0.32, 0.075, 0.105)
+    x, y = rect_point(rc, MENU_X[0], MENU_X[-1] + 0.01, MENU_Y - 0.012, MENU_Y + 0.012)
     human_move(x, y)
     think(0.3, 1.1)
 
-def wait_dialog(timeout):
+def wait_dialog_kind(timeout, pre):
+    """'window' (real Win32 dialog), 'panel' (side panel inside CADCraft) or None."""
     end = time.time() + timeout
+    main = main_hwnd()
     while time.time() < end:
         h = dialog_hwnd()
-        if h:
-            return h
-        quiet_nap(0.15)
-    return 0
+        if h and h != main:
+            return "window"
+        d = changed(pre, grab(PANEL_BOX), 4)
+        if d is not None and d > PANEL_THRESH:
+            return "panel"
+        quiet_nap(0.2)
+    return None
 
-def close_dialogs(accept=False, assume_open=False):
-    """Close whatever dialog / menu is open, with mouse movement and a key press or a click on the X."""
+def close_dialogs(accept=False):
+    """Close real dialog windows / menus (side panels use close_panel)."""
     prev = S.in_dialog
     S.in_dialog = True
     try:
         for attempt in range(4):
             h = dialog_hwnd()
-            if not h and not (assume_open and attempt == 0):
+            if not h:
                 break
-            is_menu = bool(h) and h == main_hwnd()
-            rc = None if is_menu else (win_rect(h) if h else win_rect(main_hwnd()))
+            is_menu = h == main_hwnd()
+            rc = None if is_menu else win_rect(h)
             quiet_nap(random.uniform(0.3, 0.9))
             if rc:
                 human_move(*rect_point(rc, 0.25, 0.85, 0.3, 0.9))
@@ -1360,79 +1548,62 @@ def close_dialogs(accept=False, assume_open=False):
             if is_menu:
                 kb_press("escape")
             elif attempt == 0:
-                if CLOSE_BY_CLICK and rc and h and not accept and random.random() < 0.45:
+                if CLOSE_BY_CLICK and rc and not accept and random.random() < 0.45:
                     human_click(rc[2] - X_BTN[0], rc[1] + X_BTN[1])
                 else:
                     kb_press("enter" if accept else "escape")
             elif attempt == 1:
                 kb_press("escape")
-            elif attempt == 2 and h and h != main_hwnd() and IS_WIN:
-                user32.PostMessageW(h, 0x0010, 0, 0)          # WM_CLOSE as a last resort
+            elif attempt == 2 and h != main_hwnd() and IS_WIN:
+                user32.PostMessageW(h, 0x0010, 0, 0)
             quiet_nap(random.uniform(0.5, 0.9))
-            if assume_open and not h:
-                break
+        if panel_open():
+            close_panel()
         if not app_ok():
             activate_main()
             quiet_nap(0.6)
     finally:
         S.in_dialog = prev
 
-def act_dialog():
-    name = random.choices(list(DIALOGS), [DIALOGS[n].get("w", 1.0) for n in DIALOGS])[0]
+def act_dialog(name=None):
+    """Open a dialog / panel, look around it with the mouse (never click inside), close it."""
+    if name is None:
+        name = random.choices(list(DIALOGS), [DIALOGS[n].get("w", 1.0) for n in DIALOGS])[0]
     spec = DIALOGS[name]
     log(f"dialog: {name}")
     think(0.5, 1.6)
     hover_menu_bar()
     nap(random.uniform(0.15, 0.5))
-    hwnd = 0
+    park_mouse()
+    pre = grab(PANEL_BOX)
     try:
-        S.in_dialog = True          # BEFORE the command: the dialog pops up while say() is still napping
+        S.in_dialog = True
         say(spec["alias"])
-        hwnd = wait_dialog(2.5)
-        if not hwnd and not DIALOGS_IN_WINDOW:
-            log("no dialog window detected - cancelling")
+        kind = wait_dialog_kind(3.0, pre)
+        if kind is None:
+            log(f"'{spec['alias']}' opened nothing I can see - cancelling")
             kb_press("escape")
             return
-        quiet_nap(random.uniform(0.5, 1.2))
-        rc = win_rect(hwnd) if hwnd else win_rect(main_hwnd())
+        quiet_nap(random.uniform(0.8, 1.4))
+        if kind == "window":
+            h = dialog_hwnd()
+            rc = win_rect(h) if h else None
+        else:
+            rc = panel_rect_px()
         if rc:
-            human_move(*rect_point(rc, 0.2, 0.8, 0.25, 0.75))
-            think(0.6, 1.8)
-        for _ in range(random.randint(*spec["tabs"])):
-            hit("tab")
-            time.sleep(random.uniform(0.3, 0.8))
-            if rc and random.random() < 0.3:
-                human_move(*rect_point(rc, 0.1, 0.9, 0.2, 0.9), speed=0.8)
-        pokes = spec.get("pokes")
-        if pokes and hwnd:
-            for fx, fy, kind in random.sample(pokes, min(len(pokes), random.randint(1, 3))):
-                if not alive(hwnd):                    # the dialog is gone: never click on the canvas by mistake
-                    break
-                rc = win_rect(hwnd)
-                if not rc:
-                    break
-                x = rc[0] + fx * (rc[2] - rc[0]) + random.uniform(-4, 4)
-                y = rc[1] + fy * (rc[3] - rc[1]) + random.uniform(-3, 3)
-                human_click(x, y)
-                quiet_nap(random.uniform(0.5, 1.2))
-                if kind == "list":
-                    human_move(x + random.uniform(-30, 30), y + random.uniform(30, 110), speed=0.8)
-                    quiet_nap(random.uniform(0.5, 1.4))
-                    kb_press("escape")                 # closes the list only; never Enter (it would pick an item)
-                    quiet_nap(random.uniform(0.5, 0.9))
-                else:
-                    think(0.4, 1.0)
-        if rc and random.random() < 0.6 and (not hwnd or alive(hwnd)):
-            human_move(*rect_point(rc, 0.5, 0.95, 0.7, 0.95))
-            think(0.4, 1.3)
-        close_dialogs(accept=False, assume_open=(not hwnd and DIALOGS_IN_WINDOW))
+            for _ in range(random.randint(2, 4)):
+                human_move(*rect_point(rc, 0.1, 0.9, 0.08, 0.95), speed=random.uniform(0.6, 1.0))
+                think(0.6, 1.8)
+        if kind == "window":
+            close_dialogs(accept=False)
+        else:
+            close_panel()
     finally:
         S.in_dialog = False
 
 
 # ───────────────────────── OTHER ACTIONS ─────────────────────────
 def act_look_around():
-    """Zoom in and back out, or pan and back, like checking a detail."""
     if random.random() < 0.55:
         x, y = zone_point(False)
         human_move(x, y)
@@ -1465,38 +1636,42 @@ def act_look_around():
     think(0.4, 1.0)
 
 def act_peek_menu():
-    """Open a menu-bar menu, glance across a couple of menus, close it. Checked the first time."""
+    """Open a menu-bar menu, glance across a couple of menus, close it. Switched off after 3 failed attempts."""
     if not MENU_PEEK or S.menu_ok is False:
         return mouse_idle()
     S.in_dialog = True
     try:
         i = random.randrange(len(MENU_X))
-        below = (0.0, 0.34, 0.115, 0.55)               # where a drop-down appears
+        below = (0.0, 0.40, MENU_Y + 0.02, MENU_Y + 0.45)
         before = grab(below, (40, 30)) if S.menu_ok is None else None
         human_click(*win_frac(MENU_X[i], MENU_Y))
         quiet_nap(random.uniform(0.5, 1.2))
         if S.menu_ok is None:
             d = changed(before, grab(below, (40, 30)))
             if d is not None:
-                S.menu_ok = d > 0.04
-                log("menu peek verified: a menu opens where I click" if S.menu_ok else
-                    "menu peek: nothing opened where I clicked - switched off (check MENU_Y / MENU_X)")
-        if S.menu_ok is not False:
+                if d > 0.04:
+                    S.menu_ok = True
+                    log("menu peek verified: a menu opens where I click")
+                else:
+                    S.menu_fail += 1
+                    log(f"menu peek: nothing opened ({S.menu_fail}/3)")
+                    if S.menu_fail >= 3:
+                        S.menu_ok = False
+                        log("menu peek switched off (run --calibrate to measure the menu bar)")
+        if S.menu_ok is True:
             for _ in range(random.randint(0, 2)):
                 j = min(max(i + random.choice([-1, 1]), 0), len(MENU_X) - 1)
                 human_move(*win_frac(MENU_X[j], MENU_Y), speed=0.8)
                 quiet_nap(random.uniform(0.4, 1.0))
             human_move(*win_frac(MENU_X[i] + random.uniform(-0.01, 0.02), MENU_Y + random.uniform(0.04, 0.2)), speed=0.7)
             quiet_nap(random.uniform(0.5, 1.4))
-        hit("escape")                                   # closes the menu (or whatever a stray click opened)
+        hit("escape")
         quiet_nap(random.uniform(0.3, 0.7))
         close_dialogs(accept=False)
     finally:
         S.in_dialog = False
 
-
 def act_hover_panels():
-    """Mouse over the Draw tools / Properties panel, as if choosing something."""
     fx0, fx1, fy0, fy1 = random.choice([(0.01, 0.14, 0.2, 0.4), (0.835, 0.98, 0.55, 0.95), (0.835, 0.98, 0.15, 0.35)])
     for _ in range(random.randint(1, 3)):
         human_move(*win_frac(random.uniform(fx0, fx1), random.uniform(fy0, fy1)))
@@ -1504,18 +1679,18 @@ def act_hover_panels():
     human_move(*zone_point())
 
 def act_select_window():
-    """Window-select part of a finished drawing, look at it, deselect."""
-    if S.next_slot == 0:
-        return work_scene()
-    slot = random.randrange(S.next_slot if not S.scene else max(S.next_slot - 1, 1))
-    held = S.scene
-    S.scene = {"slot": slot}
+    """Window-select one part of the project, look at it, deselect."""
+    P = S.project
+    if not P or P["setup"] < 5 or P["i"] == 0:
+        return work_project()
+    held = S.slot
+    S.slot = random.randrange(len(P["parts"]))
     try:
         click_at(-0.03, -0.03)
         click_at(random.uniform(0.5, 1.03), random.uniform(0.5, 1.03))
         think(1.2, 3.0)
     finally:
-        S.scene = held
+        S.slot = held
     hit("escape")
     nap(0.3)
     hit("escape")
@@ -1524,6 +1699,9 @@ def mouse_idle():
     for _ in range(random.randint(1, 4)):
         human_move(*zone_point())
         think(0.4, 1.4)
+
+def act_think():
+    think(4.0, 11.0)
 
 
 def run_one_action():
@@ -1537,36 +1715,20 @@ def run_one_action():
             heal()
             S.needs_heal = False
         S.needs_heal = True
+        ensure_clean()
         restore_view()
         focus_canvas()
         S.fresh = False
-
         if random.random() < 0.5:
             human_move(*zone_point())
             time.sleep(random.uniform(0.15, 0.6))
 
-        if S.scene and random.random() < 0.75:
-            work_scene()
+        if random.random() < 0.75:
+            work_project()
         else:
-            r = random.random()
-            dlg = 0.08 * DIALOG_CHANCE_WEIGHT
-            if r < 0.50:
-                work_scene()
-            elif r < 0.58:
-                act_look_around()
-            elif r < 0.64:
-                act_select_window()
-            elif r < 0.64 + dlg:
-                act_dialog()
-            elif r < 0.78:
-                act_peek_menu()
-            elif r < 0.86:
-                act_hover_panels()
-            elif r < 0.95:
-                mouse_idle()
-            else:
-                think(4.0, 11.0)
-
+            acts = [(act_look_around, 3.0), (act_select_window, 1.5), (act_dialog, 1.2 * DIALOG_CHANCE_WEIGHT),
+                    (act_peek_menu, 1.5), (act_hover_panels, 1.2), (mouse_idle, 1.3), (act_think, 0.6)]
+            random.choices([a for a, _ in acts], [w for _, w in acts])[0]()
         S.needs_heal = False
     except Interrupted as e:
         log(f"aborted: {e.reason}")
@@ -1661,16 +1823,27 @@ def open_app():
     return False
 
 def check_monitor():
-    rc = win_rect(main_hwnd())
-    if not rc:
-        return
-    sw, sh = pyautogui.size()
-    if rc[0] < -12 or rc[1] < -12 or rc[2] > sw + 12 or rc[3] > sh + 12:
-        log(f"warning: the CADCraft window {rc} is not fully on the primary screen ({sw}x{sh}). "
-            "Move it to the main monitor and maximise it: other monitors are not supported.")
+    """The whole CADCraft window must be on the main screen (a window partly off-screen shifts every position)."""
+    for attempt in (1, 2):
+        rc = win_rect(main_hwnd())
+        if not rc:
+            return
+        sw, sh = pyautogui.size()
+        if not (rc[0] < -12 or rc[1] < -12 or rc[2] > sw + 12 or rc[3] > sh + 12):
+            return
+        if attempt == 1:
+            log(f"the CADCraft window {rc} is not fully on the main screen ({sw}x{sh}) - maximising it")
+            for w in app_windows():
+                try:
+                    w.maximize()
+                except Exception:
+                    pass
+            time.sleep(1.2)
+            S.hwnd = 0
+            S.hwnd_scan = 0.0
+    log("warning: CADCraft is still not fully on the main screen. Move it there and maximise it.")
 
 def ensure_own_drawing():
-    """If CADCraft was already open, work in a brand-new drawing so nothing of yours is ever touched."""
     if not (S.reused and NEW_DRAWING_IF_REUSED):
         return
     log("CADCraft was already open: starting a NEW drawing (Ctrl+N) so your work is left alone")
@@ -1683,9 +1856,16 @@ def ensure_own_drawing():
         if dialog_hwnd():
             log("template dialog: accepting the default")
             close_dialogs(accept=True)
+        elif panel_open():
+            kb_press("enter")
+            quiet_nap(1.0)
+            if panel_open():
+                close_panel()
         quiet_nap(1.0)
     finally:
         S.in_dialog = False
+    S.blank = True
+    S.saved = False
 
 def startup():
     global action_started
@@ -1694,6 +1874,13 @@ def startup():
         if not bring_back():
             log("could not bring CADCraft forward")
             return False
+        for _ in range(2):
+            hit("escape")
+            nap(0.2)
+        if PANEL_REF is None:
+            capture_panel_ref()
+            log("panel reference taken from the current screen (assuming NO side panel is open right now)")
+        ensure_clean()
         ensure_own_drawing()
         return True
     except Interrupted as e:
@@ -1706,36 +1893,31 @@ def startup():
         return False
 
 def probe_dialog():
-    """Open Units, find out how dialogs show up (separate window / drawn inside the app), close it again."""
-    global DIALOGS_IN_WINDOW
+    """Open Drafting Settings: is it a real window or an in-window side panel? Close it again."""
     park_mouse()
-    before = grab(CENTER_BOX)
+    pre = grab(PANEL_BOX)
     S.in_dialog = True
     try:
-        say("un")
-        h = wait_dialog(2.5)
-        mode = "window" if h else None
-        if not h:
-            quiet_nap(1.0)
-            d = changed(before, grab(CENTER_BOX))
-            if d is not None and d > 0.12:
-                mode = "inside"
-        if mode == "window":
-            log("dialogs: separate windows - detection works")
+        say("ds")
+        kind = wait_dialog_kind(3.0, pre)
+        quiet_nap(0.8)
+        S.dialog_kind = kind
+        if kind == "window":
+            log("dialogs: separate windows")
             close_dialogs(accept=False)
-        elif mode == "inside":
-            DIALOGS_IN_WINDOW = True
-            log("dialogs: drawn inside the CADCraft window - DIALOGS_IN_WINDOW switched on for this run")
-            close_dialogs(accept=False, assume_open=True)
+        elif kind == "panel":
+            log("dialogs: in-window side panels - handled by screenshot + X button")
+            close_panel()
+            if panel_open():
+                return None
         else:
-            log("dialogs: nothing opened after UN - the command line or its aliases may not work")
+            log("dialogs: nothing opened after DS - the command line or its aliases may not work")
             hit("escape")
-        return mode
+        return kind
     finally:
         S.in_dialog = False
 
 def run_probes():
-    """Quiet start-up checks of dialogs and menus (their results switch features on or off)."""
     global action_started
     action_started = time.time()
     try:
@@ -1756,6 +1938,81 @@ def run_probes():
     finally:
         S.in_dialog = False
 
+
+# ───────────────────────── CALIBRATION ─────────────────────────
+def load_calibration():
+    global DRAW_AREA, ZONE, PANEL_BOX, PANEL_CLOSE, COMMAND_BOX, LAYER_BOX, MENU_Y, MENU_X, PANEL_REF
+    try:
+        d = json.loads(CALIB_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        log("no calibration file - using built-in layout guesses (run --calibrate for best results)")
+        return False
+    try:
+        DRAW_AREA = tuple(d["draw_area"])
+        ZONE = zone_from(DRAW_AREA)
+        COMMAND_BOX = tuple(d["command_box"])
+        PANEL_BOX = tuple(d["panel_box"])
+        PANEL_CLOSE = tuple(d["panel_close"])
+        LAYER_BOX = tuple(d["layer_box"])
+        MENU_Y = d["menu_y"]
+        MENU_X = list(d["menu_x"])
+        if d.get("panel_ref"):
+            PANEL_REF = bytes.fromhex(d["panel_ref"])
+        log(f"calibration loaded from {CALIB_FILE.name}")
+        return True
+    except Exception as e:
+        log(f"calibration file unusable ({e!r}) - using defaults")
+        return False
+
+def _point(label, secs=7):
+    print(f"\n>>> {label}\n    (hold the mouse there - capturing in {secs} s)")
+    for s in range(secs, 0, -1):
+        print(f"    {s}...", end="\r", flush=True)
+        time.sleep(1)
+    x, y = pyautogui.position()
+    rc = win_rect(main_hwnd()) or (0, 0) + tuple(pyautogui.size())
+    fx, fy = (x - rc[0]) / (rc[2] - rc[0]), (y - rc[1]) / (rc[3] - rc[1])
+    print(f"    got ({fx:.3f}, {fy:.3f})")
+    return fx, fy
+
+def calibrate():
+    """Measure the layout on THIS screen. Nothing is clicked: you only hold the mouse still."""
+    if not open_app():
+        return
+    force_activate(app_windows()[0])
+    check_monitor()
+    print("\nCALIBRATION - CADCraft must be maximised with NO side panel open. Do not click; just hold the mouse.")
+    tl = _point("TOP-LEFT corner of the EMPTY drawing area (just inside the grid, right of any tool sets)")
+    br = _point("BOTTOM-RIGHT corner of the drawing area (left of the ViewCube / Layers panel, above the command line)")
+    cmd = _point("the MIDDLE of the command-line text at the bottom (where 'Command:' is shown)")
+    fm = _point("the centre of the 'File' menu title (first menu)")
+    hm = _point("the centre of the 'Help' menu title (last menu)")
+    lay = _point("the current-layer row in the Layers panel (the row with the light bulb and the layer name)")
+    print("\nNow OPEN Drafting Settings yourself (click in CADCraft, type DS and press Enter).")
+    px_ = _point("the X (close) button of the Drafting Settings panel", secs=14)
+    print("\nNow CLOSE the panel with that X. Leave NO panel open. Do not touch anything after closing.")
+    time.sleep(8)
+    global PANEL_BOX
+    PANEL_BOX = (0.0, max(px_[0] - 0.004, 0.05), 0.12, 0.95)
+    park_mouse()
+    ref = grab(PANEL_BOX)
+    n = 11
+    menu_x = [fm[0] + (hm[0] - fm[0]) * i / (n - 1) for i in range(n)]
+    data = {
+        "draw_area": [round(tl[0], 4), round(br[0], 4), round(tl[1], 4), round(br[1], 4)],
+        "command_box": [max(cmd[0] - 0.19, 0.0), min(cmd[0] + 0.19, 1.0), max(cmd[1] - 0.03, 0.0), min(cmd[1] + 0.03, 1.0)],
+        "panel_box": list(PANEL_BOX),
+        "panel_close": [round(px_[0], 4), round(px_[1], 4)],
+        "layer_box": [max(lay[0] - 0.14, 0.0), min(lay[0] + 0.14, 1.0), lay[1] - 0.02, lay[1] + 0.02],
+        "menu_y": round((fm[1] + hm[1]) / 2, 4),
+        "menu_x": [round(v, 4) for v in menu_x],
+        "panel_ref": ref.hex() if ref else "",
+    }
+    CALIB_FILE.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    print(f"\nSaved {CALIB_FILE}\nNext:  python cadwriter.py --test")
+
+
+# ───────────────────────── SELF TEST ─────────────────────────
 def self_check():
     """--test: a fast end-to-end check of every assumption; prints PASS / FAIL lines."""
     global action_started
@@ -1769,24 +2026,31 @@ def self_check():
     try:
         heal()
         focus_canvas()
-        new_scene()                                     # 1. drawing: command line, aliases, clicks
-        sc = S.scene
+        kind = probe_dialog()
+        rep(kind is not None, f"dialogs: Drafting Settings opened as '{kind}'")
+        rep(not panel_open() and not dialog_hwnd(), "dialogs: closed again, nothing left open")
+        new_project()
+        P = S.project
         before = look_canvas()
-        for st in sc["steps"][:4]:
-            do_step(st)
-            sc["i"] += 1
+        S.cmd_dead = S.click_dead = 0
+        for it in P["queue"][:4]:
+            S.slot = it["slot"]
+            do_step(it["st"])
+            P["i"] += 1
         d = changed(before, look_canvas())
         if d is None:
             log("INFO  could not compare screenshots (is Pillow installed?)")
         else:
             rep(d >= CHANGE_MIN, f"drawing: {d * 100:.1f}% of the canvas changed (needs {CHANGE_MIN * 100:.1f}%)")
-        mode = probe_dialog()                           # 2. dialogs
-        rep(mode is not None, f"dialogs: opened and closed ({mode or 'nothing opened'})")
-        S.menu_ok = None                                # 3. menu bar
+        rep(S.cmd_dead == 0 and S.click_dead == 0, "commands and clicks: the command line / prompt reacted every time")
+        make_layers()
+        rep(S.layers_ok is not False, "layers: -LAYER works (the current-layer row changed)")
+        S.menu_ok, S.menu_fail = None, 0
         act_peek_menu()
         rep(S.menu_ok is True, "menu bar: clicking a menu title opens a menu")
-        save()                                          # 4. Save As
-        rep(S.saved, "save: Save As dialog found and the file name typed")
+        S.saved = False
+        save()
+        rep(S.saved, "save: Save As dialog found and the project name typed")
     except Interrupted as e:
         log(f"test aborted: {e.reason} (touching the mouse or keyboard stops it)")
         return False
@@ -1796,8 +2060,12 @@ def self_check():
     log("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED - see the FAIL lines above")
     return ok
 
+
 def main():
     global last_input, SPEED, TYPING_SPEED, WPM_MAX, TYPO_CHANCE
+    if "--calibrate" in sys.argv:
+        calibrate()
+        return
     test = "--test" in sys.argv
     log("=" * 56)
     log(f"{PAUSE_KEY} pause/resume  |  {QUIT_KEY} quit  |  top-left = failsafe" + ("  |  TEST MODE" if test else ""))
@@ -1806,6 +2074,10 @@ def main():
         log("warning: not Windows - dialog detection is disabled")
     if Image is None:
         log("warning: Pillow is missing (pip install pillow) - the screen checks are disabled")
+    if IS_WIN and not is_admin():
+        log("note: if CADCraft runs as Administrator, Windows ignores this script's clicks and keys - "
+            "start both the same way")
+    load_calibration()
     if test:
         SPEED, TYPING_SPEED, WPM_MAX, TYPO_CHANCE = 0.35, 0.4, 999, 0.0
 
