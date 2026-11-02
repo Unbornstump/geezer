@@ -72,18 +72,19 @@ BOLD_HEADERS  = False
 USE_F2        = True
 
 IDLE_AFTER    = 11                          # seconds of no real input before it acts again
-GAP_BETWEEN   = (6, 24)
+GAP_BETWEEN   = (8, 35)
 LONG_BREAK_CHANCE = 0.09
 LONG_BREAK    = (30, 110)
 
 # typing. BASE_DELAY is the median time between key presses (seconds).
-# 0.25 + symbol/shift penalties + pauses lands around 30-38 WPM.
+# 0.40 + symbol/shift penalties + pauses lands around 12-20 WPM.
 # Raise TYPING_SPEED (e.g. 1.2) to be slower, lower it (0.9) to be faster.
-BASE_DELAY    = 0.25
+BASE_DELAY    = 0.40
 TYPING_SPEED  = 1.0
-TYPO_CHANCE   = 0.025
-MICRO_STOP    = 0.06
-KEY_DWELL     = (0.045, 0.12)               # how long a key is held down
+WPM_MIN, WPM_MAX = 12, 20                   # the script self-corrects into this range
+TYPO_CHANCE   = 0.03
+MICRO_STOP    = 0.08
+KEY_DWELL     = (0.06, 0.15)                # how long a key is held down
 
 ZONE = (0.15, 0.85, 0.45, 0.85)
 
@@ -478,6 +479,9 @@ class State:
         self.hwnd_scan = 0.0
         self.chars = 0                 # typing statistics
         self.type_secs = 0.0
+        self.drift = 1.0               # slow random walk: attention / fatigue
+        self.governor = 1.0            # auto-corrects speed toward the WPM target
+        self.cell_mult = 1.0           # per-cell speed: some cells typed brisk, some slow            # auto-corrects speed toward the WPM target
         self.reset_layout()
 
     def reset_layout(self):
@@ -953,32 +957,56 @@ def neighbor(ch):
 SHIFTED = set('_(){}[]:"<>?+|~!@#$%^&*')
 SYMBOLS = set("(),:;=^*/+-$.")
 
+LEFT_KEYS = set("qwertasdfgzxcvb12345`")
+COMMON_PAIRS = {"th","he","in","er","an","re","on","at","en","nd","ti","es","or","te",
+                "of","ed","is","it","al","ar","st","to","nt","ng","se","ha","as","ou","io","le"}
+
+def _hand(ch):
+    return "L" if ch.lower() in LEFT_KEYS else "R"
+
 def key_delay(prev, ch, speed):
     """Target time between two key presses."""
-    d = random.lognormvariate(math.log(BASE_DELAY), 0.36) * TYPING_SPEED * speed * S.rhythm
-    if prev == ch:
-        d *= 0.85
-    if ch.isupper() or ch in SHIFTED:
-        d *= 1.3
+    d = (random.lognormvariate(math.log(BASE_DELAY), 0.45)
+         * TYPING_SPEED * speed * S.rhythm * S.drift * S.governor * S.cell_mult)
+    if prev and prev.isalpha() and ch.isalpha():
+        if prev == ch:
+            d *= 0.9
+        elif _hand(prev) != _hand(ch):
+            d *= 0.93
+        else:
+            d *= 1.05
+        if (prev + ch).lower() in COMMON_PAIRS:
+            d *= 0.9
+    if ch.isupper():
+        d *= 1.35                              # shift + letter
     elif ch.isdigit():
-        d *= 1.12
-    if ch in SYMBOLS:
-        d += random.uniform(0.03, 0.17)        # symbols and brackets: look at the keyboard / think
+        d *= 1.2                               # reach to the number row
+    if ch in "()[]{}":
+        d += random.uniform(0.15, 0.55)        # shift + reach for brackets
+        if random.random() < 0.25:
+            d += random.uniform(0.2, 0.6)      # hesitate at a bracket
+    elif ch in SYMBOLS:
+        d += random.uniform(0.08, 0.40)        # = ^ * / + - , : $ .
+    if ch == "(" and prev.isalpha():
+        d += random.uniform(0.05, 0.25)        # finished a function name
     if prev in "(,=":
-        d += random.uniform(0.0, 0.14)         # deciding what comes next
+        d += random.uniform(0.1, 0.4)          # deciding what comes next
     if prev == " ":
-        d += random.uniform(0.0, 0.1)
+        d += random.uniform(0.04, 0.2)
+    if prev == ")" and ch not in ")+-*/^,":
+        d += random.uniform(0.1, 0.35)
     if S.burst > 0:
-        d *= 0.82
+        d *= 0.9
         S.burst -= 1
-    elif random.random() < 0.04:
-        S.burst = random.randint(3, 6)
+    elif random.random() < 0.03:
+        S.burst = random.randint(3, 5)
     r = random.random()
     if r < MICRO_STOP:
-        d += random.uniform(0.25, 0.8)
-    elif r < MICRO_STOP + 0.008:
-        d += random.uniform(1.0, 2.6)
+        d += random.uniform(0.3, 1.0)
+    elif r < MICRO_STOP + 0.012:
+        d += random.uniform(1.2, 3.5)          # lost the thread for a moment
     return d
+
 
 def emit(ch, prev, speed):
     guard()
@@ -1027,21 +1055,36 @@ def type_text(text, typos=True, speed=1.0):
         i += 1
     S.chars += len(text)
     S.type_secs += time.time() - t_start
+    govern()
 
 def typing_wpm():
     if S.type_secs < 8:
         return None
     return (S.chars / 5.0) / (S.type_secs / 60.0)
 
+def govern():
+    """Only ever slows typing down if it creeps above WPM_MAX; never speeds it up."""
+    w = typing_wpm()
+    if w and w > WPM_MAX:
+        S.governor = min(S.governor * 1.10, 2.5)
+    elif w and w < WPM_MIN and S.governor > 1.0:
+        S.governor = max(S.governor / 1.03, 1.0)   # relax back, but never below 1.0
+    S.chars *= 0.96
+    S.type_secs *= 0.96
+
+
 def type_cell(text):
     S.rhythm = min(max(S.rhythm * random.uniform(0.94, 1.06), 0.85), 1.35)
+    S.drift = min(max(S.drift + random.uniform(-0.03, 0.035), 0.85), 1.3)
+    S.cell_mult = min(max(random.lognormvariate(0, 0.25), 0.8), 1.7)
     if text.startswith("="):
-        if random.random() < 0.7:
-            think(0.7, 2.6)
-    elif random.random() < 0.15:
-        think(0.3, 1.0)
+        if random.random() < 0.8:
+            think(0.8 + len(text) * 0.03, 2.4 + len(text) * 0.06)
+    elif random.random() < 0.18:
+        think(0.4, 1.3)
     type_text(text)
-
+    if text.startswith("=") and random.random() < 0.35:
+        think(0.5, 1.8)                    # glance at what was just typed
 
 # ───────────────────────── GRID NAVIGATION ─────────────────────────
 def press_n(key, n):
@@ -1713,7 +1756,7 @@ def main():
                     ambient_move()
                 continue
             run_one_action()
-            gap = random.uniform(*GAP_BETWEEN)
+            gap = min(max(random.lognormvariate(math.log(15), 0.5), GAP_BETWEEN[0]), 70)
             if random.random() < LONG_BREAK_CHANCE:
                 gap += random.uniform(*LONG_BREAK)
             next_at = time.time() + gap
