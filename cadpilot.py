@@ -1,5 +1,5 @@
 """
-cadwriter.py (v1)  -  drawing-presence automation for CADCraft (Windows)
+cadwriter.py (v2)  -  drawing-presence automation for CADCraft (Windows)
 
 Drives CADCraft like a person drafting: starts commands from the command line (or
 sometimes by clicking the Draw tool icons), clicks points on the canvas one at a time,
@@ -13,9 +13,30 @@ Same awareness as gridwriter v2: it stops the moment you touch the mouse/keyboar
 another window comes to the front, waits IDLE_AFTER seconds, cancels any half-finished
 command with Escape, closes stray dialogs, and goes back to the exact step it was on.
 
-pip install pyautogui pygetwindow pynput
+pip install pyautogui pygetwindow pynput pillow
 Windows + US keyboard assumed.
 F8 = pause/resume   F9 = quit   mouse top-left = emergency stop
+
+FIRST RUN:  python cadwriter.py --test
+  A fast self-check: draws a few shapes, opens a dialog, opens a menu, saves, and prints
+  PASS / FAIL for every assumption below. Fix the FAILs, then run it normally.
+
+WHAT'S NEW IN v2
+  * It looks at the screen. After a few drawing steps it parks the mouse off the canvas and
+    compares screenshots. If nothing appeared twice in a row (hidden command line, other
+    aliases, wrong window) it PAUSES and says so, instead of typing blindly for hours.
+  * It never touches your own work. If CADCraft was already open it starts a NEW drawing
+    (Ctrl+N), and ERASE ALL only runs in a drawing it saved itself (after its own Save As);
+    otherwise it stops and asks you to confirm with F8.
+  * Dialogs: it works out whether they are separate windows or drawn inside the app, never
+    presses Enter/Space inside one (so Plot can never actually plot; only the Save prompt is
+    accepted), pokes at the Plot dialog's drop-downs and check boxes, then cancels.
+    (Fixed: v1 aborted every dialog because it was not yet "inside the dialog" when the
+    dialog popped up.)
+  * Menu peeks are verified once (a menu must really open) and switched off if not, so a
+    mis-aimed click can never land on a toolbar icon again and again.
+  * DPI-aware, keeps the PC awake while running, writes cadwriter.log in WORK_DIR, releases
+    every key and mouse button on exit, warns if CADCraft is not on the main monitor.
 
 ASSUMPTIONS ABOUT CADCRAFT (check on a first short test run):
   * the window title contains APP_MATCH ("cadcraft")
@@ -45,13 +66,24 @@ import time
 import traceback
 from pathlib import Path
 
-import pyautogui
-import pygetwindow as gw
-from pynput import keyboard, mouse
-
 IS_WIN = sys.platform == "win32"
 if IS_WIN:
     from ctypes import wintypes
+    try:                                    # Win32 rectangles and pyautogui must agree on scaled displays
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+import pyautogui
+import pygetwindow as gw
+from pynput import keyboard, mouse
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 # ───────────────────────── CONFIG ─────────────────────────
 WORK_DIR      = Path(r"C:\work")
@@ -97,6 +129,16 @@ MENU_X = [0.017, 0.036, 0.059, 0.084, 0.115, 0.143, 0.169, 0.204, 0.244, 0.279, 
 PAUSE_KEY, QUIT_KEY = "<f8>", "<f9>"
 LAUNCH_TIMEOUT = 60
 
+SPEED         = 1.0                         # pacing multiplier (--test lowers it)
+NEW_DRAWING_IF_REUSED = True                # CADCraft already open -> Ctrl+N, never draw in your drawing
+PROBE_ON_START = True                       # quick dialog / menu check before the first real action
+MENU_PEEK     = True                        # glance at menu-bar menus now and then (verified once)
+VERIFY_DRAWING = True                       # screenshot checks that drawing really appears
+CHANGE_MIN    = 0.004                       # fraction of the canvas that must change after a few steps
+CENTER_BOX    = (0.36, 0.72, 0.22, 0.88)    # where dialogs show up (fractions l, r, t, b of the window)
+X_BTN         = (24, 23)                    # a dialog's title-bar X: pixels left of / below its top-right corner
+LOG_FILE      = WORK_DIR / "cadwriter.log"
+
 # dialogs: opened by typing a command; "tabs" = Tab presses inside; closed by Escape or the title-bar X
 DIALOG_CHANCE_WEIGHT = 1.0
 DIALOGS_IN_WINDOW = False
@@ -107,11 +149,25 @@ DIALOGS = {
     "dimstyle":  {"alias": "d",    "tabs": (0, 4), "w": 0.8},
     "textstyle": {"alias": "st",   "tabs": (0, 3), "w": 0.6},
     "options":   {"alias": "op",   "tabs": (0, 5), "w": 0.6},
-    "plot":      {"alias": "plot", "tabs": (0, 4), "w": 0.6},
+    "plot":      {"alias": "plot", "tabs": (0, 4), "w": 0.8,
+                  # Click targets inside the Plot dialog, as fractions of its window (measured on a screenshot).
+                  # "list" = drop-down (looked at, then closed with ONE Escape), "tick" = check box / radio.
+                  # Nothing here ever presses OK or Preview, and the dialog is always cancelled.
+                  "pokes": [(0.36, 0.12, "list"), (0.46, 0.20, "list"), (0.46, 0.27, "list"),
+                            (0.25, 0.33, "tick"), (0.40, 0.33, "tick"), (0.35, 0.39, "list"),
+                            (0.25, 0.45, "tick"), (0.25, 0.51, "tick"), (0.25, 0.76, "tick"),
+                            (0.25, 0.82, "tick"), (0.46, 0.88, "list")]},
 }
 
 # ───────────────────────── LOGGING / SAFETY ─────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+_handlers = [logging.StreamHandler()]
+try:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    _handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except Exception:
+    pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S",
+                    handlers=_handlers)
 log = logging.info
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
@@ -213,6 +269,11 @@ class State:
         self.next_slot = 0
         self.scenes_done = 0
         self.view = {"zoom": 0, "zpos": None, "pan": (0, 0)}
+        self.reused = False            # attached to a CADCraft that was already open
+        self.menu_ok = None            # None = not verified yet; True / False after the first menu peek
+        self.checks = 0                # drawing checks done so far
+        self.dead = 0                  # consecutive checks where nothing appeared
+        self.erase_warned = False      # the user was asked before erasing a drawing we did not save
 
 
 S = State()
@@ -462,6 +523,8 @@ def bring_back():
     for _ in range(3):
         activate_main()
         time.sleep(0.75)
+        if dialog_hwnd():                         # the Alt tap can leave the menu bar in menu mode
+            close_dialogs(accept=False)
         if app_ok():
             return True
     return False
@@ -490,7 +553,7 @@ def hit(*keys):
         kb_hotkey(*keys)
 
 def nap(seconds):
-    end = time.time() + seconds
+    end = time.time() + seconds * SPEED
     while True:
         left = end - time.time()
         if left <= 0:
@@ -502,7 +565,7 @@ def nap(seconds):
         guard()
 
 def quiet_nap(seconds):
-    end = time.time() + seconds
+    end = time.time() + seconds * SPEED
     while time.time() < end:
         time.sleep(min(0.2, max(0.0, end - time.time())))
         guard(False)
@@ -549,7 +612,7 @@ def human_move(tx, ty, speed=1.0):
     dist = math.hypot(tx - sx, ty - sy)
     if dist < 3:
         return
-    dur = (0.17 + 0.11 * math.log2(1 + dist / 55)) * random.uniform(0.9, 1.4) / speed
+    dur = (0.17 + 0.11 * math.log2(1 + dist / 55)) * random.uniform(0.9, 1.4) / speed * SPEED
     if dist > 260 and random.random() < 0.28:
         ux, uy = (tx - sx) / dist, (ty - sy) / dist
         o = random.uniform(9, 20)
@@ -606,6 +669,101 @@ def win_frac(fx, fy):
         sw, sh = pyautogui.size()
         return fx * sw, fy * sh
     return rc[0] + fx * (rc[2] - rc[0]), rc[1] + fy * (rc[3] - rc[1])
+
+# ── EYES: tiny screenshot comparisons, so the script notices what really happened ──
+def park_mouse():
+    """Look away from the canvas: the crosshair and tooltips would otherwise show up in screenshots."""
+    human_move(*win_frac(random.uniform(0.04, 0.10), random.uniform(0.50, 0.60)), speed=0.8)
+    quiet_nap(random.uniform(0.25, 0.6))
+
+def grab(box, size=(48, 32)):
+    """Tiny grey-scale picture of part of the CADCraft window (box = fractions l, r, t, b), or None."""
+    if Image is None:
+        return None
+    try:
+        sw, sh = pyautogui.size()
+        l, t, r, b = win_rect(main_hwnd()) or (0, 0, sw, sh)
+        W, H = r - l, b - t
+        x0, y0 = max(int(l + box[0] * W), 0), max(int(t + box[2] * H), 0)
+        x1, y1 = min(int(l + box[1] * W), sw), min(int(t + box[3] * H), sh)
+        if x1 - x0 < 20 or y1 - y0 < 20:
+            return None
+        im = pyautogui.screenshot(region=(x0, y0, x1 - x0, y1 - y0)).convert("L")
+        return im.resize(size, getattr(Image, "Resampling", Image).BOX).tobytes()
+    except Exception:
+        return None
+
+def changed(a, b, cell=3):
+    """Fraction of cells that differ between two grab()s, or None if either is missing."""
+    if not a or not b or len(a) != len(b):
+        return None
+    return sum(1 for x, y in zip(a, b) if abs(x - y) > cell) / len(a)
+
+def dialog_up(before=None):
+    """A dialog is open: a real window, or (in-window mode) the middle of the window changed."""
+    if dialog_hwnd():
+        return True
+    if DIALOGS_IN_WINDOW and before:
+        d = changed(before, grab(CENTER_BOX))
+        return d is not None and d > 0.12
+    return False
+
+def look_canvas():
+    park_mouse()
+    return grab(DRAW_AREA, (64, 40))
+
+def verify_drawing(before):
+    """After a few steps something must have appeared on the canvas. Two blank checks in a row -> pause."""
+    d = changed(before, look_canvas())
+    if d is None:
+        return True
+    S.checks += 1
+    if d >= CHANGE_MIN:
+        S.dead = 0
+        log(f"check: canvas changed ({d * 100:.1f}% of the picture)")
+        return True
+    S.dead += 1
+    log(f"check: NOTHING appeared on the canvas ({S.dead}/2)")
+    if S.dead >= 2:
+        log("=" * 56)
+        log("Nothing is being drawn. Likely causes: the command line is hidden or uses other aliases,")
+        log("DRAW_AREA is wrong, or CADCraft is not the window being driven.")
+        log("Fix it, then press F8 to carry on (or F9 to quit).")
+        log("=" * 56)
+        S.dead = 0
+        running.clear()
+        raise Interrupted("verify")
+    return False
+
+def alive(h):
+    try:
+        return bool(h) and bool(user32.IsWindow(h)) and bool(user32.IsWindowVisible(h))
+    except Exception:
+        return False
+
+def release_all():
+    """Never leave a key or a mouse button held down."""
+    for k in ("shift", "ctrl", "alt"):
+        try:
+            pyautogui.keyUp(k)
+        except Exception:
+            pass
+    for b in ("left", "middle", "right"):
+        try:
+            pyautogui.mouseUp(button=b)
+        except Exception:
+            pass
+
+def keep_awake(on=True):
+    """Stop Windows from sleeping or blanking the screen while this runs (undone on exit)."""
+    if not IS_WIN:
+        return
+    try:
+        flags = 0x80000000 | ((0x1 | 0x2) if on else 0)   # ES_CONTINUOUS | SYSTEM_REQUIRED | DISPLAY_REQUIRED
+        ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+    except Exception:
+        pass
+
 
 def drift():
     x, y = pyautogui.position()
@@ -1027,6 +1185,15 @@ def undo_redo(st):
 
 # ───────────────────────── DRAWING FLOW ─────────────────────────
 def reset_drawing():
+    if not S.saved and not S.erase_warned:
+        S.erase_warned = True
+        log("=" * 56)
+        log("The canvas is full and needs clearing, but this drawing was not created and saved by me")
+        log("(no Save As has happened), so it could contain your own work. ERASE ALL has NOT been sent.")
+        log("Press F8 to confirm that clearing it is fine, or F9 to quit.")
+        log("=" * 56)
+        running.clear()
+        raise Interrupted("unsafe")
     log("clearing the canvas")
     start_cmd("erase")
     say("all")
@@ -1035,6 +1202,7 @@ def reset_drawing():
     S.next_slot = 0
     S.scene = None
     save()
+
 
 def new_scene():
     if S.next_slot >= SLOTS:
@@ -1053,6 +1221,8 @@ def work_scene():
     if not S.scene:
         new_scene()
     sc = S.scene
+    check = VERIFY_DRAWING and (S.checks < 3 or random.random() < 0.25)
+    before = look_canvas() if check else None
     todo = random.randint(2, 4)
     done = 0
     while sc["i"] < len(sc["steps"]) and done < todo:
@@ -1067,6 +1237,8 @@ def work_scene():
             think(1.0, 3.2)
         if random.random() < 0.08:
             save()
+    if check and before is not None:
+        verify_drawing(before)
     if sc["i"] >= len(sc["steps"]):
         S.scene = None
         S.scenes_done += 1
@@ -1079,9 +1251,10 @@ def work_scene():
 
 # ───────────────────────── SAVE / CLEANUP / VIEW ─────────────────────────
 def save():
+    before = grab(CENTER_BOX) if DIALOGS_IN_WINDOW else None
     hit("ctrl", "s")
     quiet_nap(random.uniform(0.8, 1.4))
-    if not dialog_hwnd():
+    if not dialog_up(before):
         return
     prev = S.in_dialog
     S.in_dialog = True
@@ -1096,11 +1269,12 @@ def save():
             hit("enter")
             quiet_nap(random.uniform(0.8, 1.5))
             S.saved = True
-        if dialog_hwnd():                     # e.g. a confirmation prompt
+        if dialog_up(before):                 # e.g. a confirmation prompt: the ONLY place Enter is accepted
             log("save opened a prompt")
-            close_dialogs(accept=True)
+            close_dialogs(accept=True, assume_open=(DIALOGS_IN_WINDOW and not dialog_hwnd()))
     finally:
         S.in_dialog = prev
+
 
 def heal():
     log("healing after interruption")
@@ -1187,7 +1361,7 @@ def close_dialogs(accept=False, assume_open=False):
                 kb_press("escape")
             elif attempt == 0:
                 if CLOSE_BY_CLICK and rc and h and not accept and random.random() < 0.45:
-                    human_click(rc[2] - 24, rc[1] + 14)
+                    human_click(rc[2] - X_BTN[0], rc[1] + X_BTN[1])
                 else:
                     kb_press("enter" if accept else "escape")
             elif attempt == 1:
@@ -1210,10 +1384,10 @@ def act_dialog():
     think(0.5, 1.6)
     hover_menu_bar()
     nap(random.uniform(0.15, 0.5))
-    say(spec["alias"])
     hwnd = 0
     try:
-        S.in_dialog = True
+        S.in_dialog = True          # BEFORE the command: the dialog pops up while say() is still napping
+        say(spec["alias"])
         hwnd = wait_dialog(2.5)
         if not hwnd and not DIALOGS_IN_WINDOW:
             log("no dialog window detected - cancelling")
@@ -1229,7 +1403,26 @@ def act_dialog():
             time.sleep(random.uniform(0.3, 0.8))
             if rc and random.random() < 0.3:
                 human_move(*rect_point(rc, 0.1, 0.9, 0.2, 0.9), speed=0.8)
-        if rc and random.random() < 0.6:
+        pokes = spec.get("pokes")
+        if pokes and hwnd:
+            for fx, fy, kind in random.sample(pokes, min(len(pokes), random.randint(1, 3))):
+                if not alive(hwnd):                    # the dialog is gone: never click on the canvas by mistake
+                    break
+                rc = win_rect(hwnd)
+                if not rc:
+                    break
+                x = rc[0] + fx * (rc[2] - rc[0]) + random.uniform(-4, 4)
+                y = rc[1] + fy * (rc[3] - rc[1]) + random.uniform(-3, 3)
+                human_click(x, y)
+                quiet_nap(random.uniform(0.5, 1.2))
+                if kind == "list":
+                    human_move(x + random.uniform(-30, 30), y + random.uniform(30, 110), speed=0.8)
+                    quiet_nap(random.uniform(0.5, 1.4))
+                    kb_press("escape")                 # closes the list only; never Enter (it would pick an item)
+                    quiet_nap(random.uniform(0.5, 0.9))
+                else:
+                    think(0.4, 1.0)
+        if rc and random.random() < 0.6 and (not hwnd or alive(hwnd)):
             human_move(*rect_point(rc, 0.5, 0.95, 0.7, 0.95))
             think(0.4, 1.3)
         close_dialogs(accept=False, assume_open=(not hwnd and DIALOGS_IN_WINDOW))
@@ -1272,22 +1465,35 @@ def act_look_around():
     think(0.4, 1.0)
 
 def act_peek_menu():
-    """Open a menu-bar menu, glance across a couple of menus, close it."""
+    """Open a menu-bar menu, glance across a couple of menus, close it. Checked the first time."""
+    if not MENU_PEEK or S.menu_ok is False:
+        return mouse_idle()
     S.in_dialog = True
     try:
         i = random.randrange(len(MENU_X))
-        x, y = win_frac(MENU_X[i], MENU_Y)
-        human_click(x, y)
+        below = (0.0, 0.34, 0.115, 0.55)               # where a drop-down appears
+        before = grab(below, (40, 30)) if S.menu_ok is None else None
+        human_click(*win_frac(MENU_X[i], MENU_Y))
         quiet_nap(random.uniform(0.5, 1.2))
-        for _ in range(random.randint(0, 2)):
-            j = min(max(i + random.choice([-1, 1]), 0), len(MENU_X) - 1)
-            human_move(*win_frac(MENU_X[j], MENU_Y), speed=0.8)
-            quiet_nap(random.uniform(0.4, 1.0))
-        human_move(*win_frac(MENU_X[i] + random.uniform(-0.01, 0.02), MENU_Y + random.uniform(0.04, 0.2)), speed=0.7)
-        quiet_nap(random.uniform(0.5, 1.4))
+        if S.menu_ok is None:
+            d = changed(before, grab(below, (40, 30)))
+            if d is not None:
+                S.menu_ok = d > 0.04
+                log("menu peek verified: a menu opens where I click" if S.menu_ok else
+                    "menu peek: nothing opened where I clicked - switched off (check MENU_Y / MENU_X)")
+        if S.menu_ok is not False:
+            for _ in range(random.randint(0, 2)):
+                j = min(max(i + random.choice([-1, 1]), 0), len(MENU_X) - 1)
+                human_move(*win_frac(MENU_X[j], MENU_Y), speed=0.8)
+                quiet_nap(random.uniform(0.4, 1.0))
+            human_move(*win_frac(MENU_X[i] + random.uniform(-0.01, 0.02), MENU_Y + random.uniform(0.04, 0.2)), speed=0.7)
+            quiet_nap(random.uniform(0.5, 1.4))
+        hit("escape")                                   # closes the menu (or whatever a stray click opened)
+        quiet_nap(random.uniform(0.3, 0.7))
         close_dialogs(accept=False)
     finally:
         S.in_dialog = False
+
 
 def act_hover_panels():
     """Mouse over the Draw tools / Properties panel, as if choosing something."""
@@ -1412,6 +1618,7 @@ def open_app():
     existing = app_windows()
     if existing:
         log("reusing already-open CADCraft window")
+        S.reused = True
         force_activate(existing[0])
         time.sleep(1.4)
         if in_app():
@@ -1423,6 +1630,7 @@ def open_app():
         return False
 
     log(f"launching {exe}")
+    S.reused = False
     subprocess.Popen([exe], cwd=str(WORK_DIR))
     deadline = time.time() + LAUNCH_TIMEOUT
     while time.time() < deadline and not stop.is_set():
@@ -1452,23 +1660,175 @@ def open_app():
     log("-> set APP_MATCH to part of the real title (and APP_EXE if the exe wasn't found)")
     return False
 
+def check_monitor():
+    rc = win_rect(main_hwnd())
+    if not rc:
+        return
+    sw, sh = pyautogui.size()
+    if rc[0] < -12 or rc[1] < -12 or rc[2] > sw + 12 or rc[3] > sh + 12:
+        log(f"warning: the CADCraft window {rc} is not fully on the primary screen ({sw}x{sh}). "
+            "Move it to the main monitor and maximise it: other monitors are not supported.")
+
+def ensure_own_drawing():
+    """If CADCraft was already open, work in a brand-new drawing so nothing of yours is ever touched."""
+    if not (S.reused and NEW_DRAWING_IF_REUSED):
+        return
+    log("CADCraft was already open: starting a NEW drawing (Ctrl+N) so your work is left alone")
+    S.in_dialog = True
+    try:
+        hit("escape")
+        nap(0.3)
+        hit("ctrl", "n")
+        quiet_nap(random.uniform(1.4, 2.2))
+        if dialog_hwnd():
+            log("template dialog: accepting the default")
+            close_dialogs(accept=True)
+        quiet_nap(1.0)
+    finally:
+        S.in_dialog = False
+
+def startup():
+    global action_started
+    action_started = time.time()
+    try:
+        if not bring_back():
+            log("could not bring CADCraft forward")
+            return False
+        ensure_own_drawing()
+        return True
+    except Interrupted as e:
+        log(f"start-up aborted: {e.reason}")
+        return False
+    except pyautogui.FailSafeException:
+        raise
+    except Exception as e:
+        log(f"start-up error: {e!r}")
+        return False
+
+def probe_dialog():
+    """Open Units, find out how dialogs show up (separate window / drawn inside the app), close it again."""
+    global DIALOGS_IN_WINDOW
+    park_mouse()
+    before = grab(CENTER_BOX)
+    S.in_dialog = True
+    try:
+        say("un")
+        h = wait_dialog(2.5)
+        mode = "window" if h else None
+        if not h:
+            quiet_nap(1.0)
+            d = changed(before, grab(CENTER_BOX))
+            if d is not None and d > 0.12:
+                mode = "inside"
+        if mode == "window":
+            log("dialogs: separate windows - detection works")
+            close_dialogs(accept=False)
+        elif mode == "inside":
+            DIALOGS_IN_WINDOW = True
+            log("dialogs: drawn inside the CADCraft window - DIALOGS_IN_WINDOW switched on for this run")
+            close_dialogs(accept=False, assume_open=True)
+        else:
+            log("dialogs: nothing opened after UN - the command line or its aliases may not work")
+            hit("escape")
+        return mode
+    finally:
+        S.in_dialog = False
+
+def run_probes():
+    """Quiet start-up checks of dialogs and menus (their results switch features on or off)."""
+    global action_started
+    action_started = time.time()
+    try:
+        if not bring_back():
+            return
+        heal()
+        focus_canvas()
+        probe_dialog()
+        quiet_nap(0.8)
+        S.menu_ok = None
+        act_peek_menu()
+    except Interrupted as e:
+        log(f"start-up checks aborted: {e.reason}")
+    except pyautogui.FailSafeException:
+        raise
+    except Exception as e:
+        log(f"start-up checks error: {e!r}")
+    finally:
+        S.in_dialog = False
+
+def self_check():
+    """--test: a fast end-to-end check of every assumption; prints PASS / FAIL lines."""
+    global action_started
+    results = []
+
+    def rep(ok, msg):
+        results.append(bool(ok))
+        log(("PASS  " if ok else "FAIL  ") + msg)
+
+    action_started = time.time()
+    try:
+        heal()
+        focus_canvas()
+        new_scene()                                     # 1. drawing: command line, aliases, clicks
+        sc = S.scene
+        before = look_canvas()
+        for st in sc["steps"][:4]:
+            do_step(st)
+            sc["i"] += 1
+        d = changed(before, look_canvas())
+        if d is None:
+            log("INFO  could not compare screenshots (is Pillow installed?)")
+        else:
+            rep(d >= CHANGE_MIN, f"drawing: {d * 100:.1f}% of the canvas changed (needs {CHANGE_MIN * 100:.1f}%)")
+        mode = probe_dialog()                           # 2. dialogs
+        rep(mode is not None, f"dialogs: opened and closed ({mode or 'nothing opened'})")
+        S.menu_ok = None                                # 3. menu bar
+        act_peek_menu()
+        rep(S.menu_ok is True, "menu bar: clicking a menu title opens a menu")
+        save()                                          # 4. Save As
+        rep(S.saved, "save: Save As dialog found and the file name typed")
+    except Interrupted as e:
+        log(f"test aborted: {e.reason} (touching the mouse or keyboard stops it)")
+        return False
+    finally:
+        S.in_dialog = False
+    ok = bool(results) and all(results)
+    log("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED - see the FAIL lines above")
+    return ok
+
 def main():
-    global last_input
+    global last_input, SPEED, TYPING_SPEED, WPM_MAX, TYPO_CHANCE
+    test = "--test" in sys.argv
     log("=" * 56)
-    log(f"{PAUSE_KEY} pause/resume  |  {QUIT_KEY} quit  |  top-left = failsafe")
+    log(f"{PAUSE_KEY} pause/resume  |  {QUIT_KEY} quit  |  top-left = failsafe" + ("  |  TEST MODE" if test else ""))
     log("=" * 56)
     if not IS_WIN:
         log("warning: not Windows - dialog detection is disabled")
+    if Image is None:
+        log("warning: Pillow is missing (pip install pillow) - the screen checks are disabled")
+    if test:
+        SPEED, TYPING_SPEED, WPM_MAX, TYPO_CHANCE = 0.35, 0.4, 999, 0.0
 
+    keep_awake(True)
     start_listeners()
-    if not open_app():
-        sys.exit(1)
-
-    self_test_injection()
-    last_input = time.time()
-    next_at = time.time() + IDLE_AFTER
-
     try:
+        if not open_app():
+            return
+        check_monitor()
+        self_test_injection()
+        last_input = time.time()
+        log(f"hands off: starting in about {IDLE_AFTER} s (any mouse or key movement restarts the wait)")
+        while not stop.is_set() and time.time() - last_input < IDLE_AFTER:
+            time.sleep(0.5)
+        if test:
+            if startup():
+                self_check()
+            return
+        startup()
+        if PROBE_ON_START:
+            run_probes()
+        next_at = time.time() + IDLE_AFTER
+
         while not stop.is_set():
             time.sleep(random.uniform(1.3, 2.9))
             if not running.is_set():
@@ -1488,6 +1848,8 @@ def main():
         pass
     finally:
         stop.set()
+        release_all()
+        keep_awake(False)
         for l in listeners:
             l.stop()
         log("session ended")
